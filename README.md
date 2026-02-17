@@ -36,7 +36,7 @@ Depends on your system, you may want to install a specific version of Pytorch wi
 
 To start the training server and open the web interface:
 ```bash
-.\start_gui.bat
+.training_ui\start_training_ui_anima.bat
 ```
 Once launched, open your browser to: `http://localhost:3000`
 
