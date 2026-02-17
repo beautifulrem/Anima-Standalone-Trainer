@@ -1,0 +1,35 @@
+# Anima LoRA Training Configuration Template
+# Model paths are loaded from Global Settings automatically.
+
+[training_arguments]
+output_name = "my_anima_lora"
+save_model_as = "safetensors"
+max_train_epochs = 20
+save_every_n_epochs = 1
+log_with = "tensorboard"
+learning_rate = 1e-4
+text_encoder_lr = 5e-5
+optimizer_type = "AdamW8bit"
+lr_scheduler = "cosine"
+lr_warmup_steps = 100
+mixed_precision = "bf16"
+gradient_checkpointing = true
+gradient_accumulation_steps = 1
+flash_attn = false
+max_data_loader_n_workers = 4
+persistent_data_loader_workers = true
+seed = 42
+cache_latents_to_disk = true
+cache_text_encoder_outputs_to_disk = true
+sample_every_n_epochs = 1
+
+[network_arguments]
+network_module = "networks.lora_anima"
+network_dim = 16
+network_alpha = 16
+network_train_unet_only = true
+
+[anima_arguments]
+timestep_sample_method = "logit_normal"
+discrete_flow_shift = 3.0
+weighting_scheme = "logit_normal"

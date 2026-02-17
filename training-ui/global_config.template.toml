@@ -1,0 +1,16 @@
+venv_path = "C:\\sd-scripts\\venv"
+
+[model_paths]
+# Absolute paths to your model files. Use double backslashes for Windows paths.
+dit_path = ""
+qwen3_path = ""
+vae_path = ""
+
+[ui]
+background = ""
+background_position = "50% 50%"
+dim_level = 0
+brightness_level = 100
+blur_level = 0
+text_shadow_size = 0
+theme = "cherry-pink"

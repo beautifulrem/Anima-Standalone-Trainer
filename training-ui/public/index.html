@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anima LoRA Training</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script>
+        // FAST LOAD: Apply theme/background before rendering body to prevent flicker
+        (function () {
+            const t = localStorage.getItem('ui_theme');
+            if (t) document.documentElement.setAttribute('data-theme', t);
+
+            const b = localStorage.getItem('ui_background');
+            if (b) {
+                try {
+                    const cfg = JSON.parse(b);
+                    if (cfg.url && cfg.url !== 'none' && cfg.url !== '') {
+                        const r = document.documentElement;
+                        r.style.setProperty('--bg-dim', cfg.dim / 100);
+                        r.style.setProperty('--bg-brightness', cfg.brightness / 100);
+                        r.style.setProperty('--bg-blur', cfg.blur + 'px');
+                        r.style.setProperty('--text-shadow-size', cfg.textShadow + 'px');
+
+                        // Create a temporary style for .app since it doesn't exist yet
+                        const s = document.createElement('style');
+                        s.id = 'early-bg';
+                        s.innerHTML = `.app { background-image: url('${cfg.url}') !important; background-position: ${cfg.position} !important; } .app::before { display: block !important; }`;
+                        document.head.appendChild(s);
+                    }
+                } catch (e) { }
+            }
+        })();
+    </script>
+</head>
+
+<body>
+    <div class="app">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="header-title">
+                    <h1>🎯 Jobs</h1>
+                </div>
+                <button id="btn-new-job" class="btn btn-primary btn-sm">+ New</button>
+            </div>
+            <div id="job-list" class="job-list">
+                <!-- Jobs rendered here -->
+            </div>
+            <div class="sidebar-footer">
+                <button id="btn-global-settings" class="btn btn-ghost btn-block">⚙️ Global Settings</button>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <div id="empty-state" class="empty-state">
+                <div class="empty-icon">🧠</div>
+                <h2>No Job Selected</h2>
+                <p>Create a new training job or select one from the sidebar</p>
+            </div>
+
+            <div id="job-editor" class="job-editor hidden">
+                <header class="editor-header">
+                    <h2 id="job-title">Job Name</h2>
+                    <div class="editor-actions">
+                        <button id="btn-save" class="btn btn-success hidden">💾 Save</button>
+                        <button id="btn-clone" class="btn btn-secondary">Clone</button>
+                        <button id="btn-run" class="btn btn-primary">▶ Train</button>
+                        <button id="btn-stop" class="btn btn-danger hidden">⏹ Stop</button>
+                        <button id="btn-delete" class="btn btn-danger" title="Delete">🗑</button>
+                    </div>
+                </header>
+
+                <!-- Tabs -->
+                <div class="tabs">
+                    <button class="tab active" data-tab="training">Training</button>
+                    <button class="tab" data-tab="dataset">Dataset</button>
+                    <button class="tab" data-tab="network">Network</button>
+                    <button class="tab" data-tab="prompts">Prompts</button>
+                    <button class="tab" data-tab="samples">Samples</button>
+                    <button class="tab" data-tab="console">Console</button>
+                    <button class="tab" data-tab="tensorboard">📊 TensorBoard</button>
+                    <button class="tab" data-tab="settings">⚙️</button>
+                </div>
+
+                <!-- Tab Content -->
+                <div class="tab-content">
+                    <!-- Training Tab -->
+                    <div id="tab-training" class="tab-pane active">
+                        <h4>Optimization</h4>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Learning Rate</label>
+                                <input type="text" id="cfg-learning-rate" value="5e-5" placeholder="5e-5">
+                            </div>
+                            <div class="form-group">
+                                <label>Text Encoder LR</label>
+                                <input type="text" id="cfg-text-encoder-lr" value="5e-5" placeholder="5e-5">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Optimizer</label>
+                                <select id="cfg-optimizer">
+                                    <option value="AdamW8bit">AdamW8bit</option>
+                                    <option value="AdamW">AdamW</option>
+                                    <option value="Adafactor">Adafactor</option>
+                                    <option value="Lion8bit">Lion8bit</option>
+                                    <option value="SGDNesterov8bit">SGDNesterov8bit</option>
+                                    <option value="Prodigy">Prodigy</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>LR Scheduler</label>
+                                <select id="cfg-lr-scheduler">
+                                    <option value="cosine">Cosine</option>
+                                    <option value="constant">Constant</option>
+                                    <option value="linear">Linear</option>
+                                    <option value="cosine_with_restarts">Cosine w/ Restarts</option>
+                                    <option value="polynomial">Polynomial</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>LR Warmup Steps</label>
+                                <input type="number" id="cfg-lr-warmup" value="100" min="0">
+                            </div>
+                            <div class="form-group">
+                                <label>Seed</label>
+                                <input type="number" id="cfg-seed" value="42">
+                            </div>
+                        </div>
+
+                        <h4>Training Schedule</h4>
+                        <div class="form-group">
+                            <label>Duration Unit</label>
+                            <div class="checkbox-group">
+                                <label><input type="radio" name="duration-unit" value="epochs" checked> Epochs</label>
+                                <label><input type="radio" name="duration-unit" value="steps"> Steps</label>
+                            </div>
+                        </div>
+
+                        <!-- Epochs -->
+                        <div id="schedule-epochs">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Max Epochs</label>
+                                    <input type="number" id="cfg-max-epochs" value="20" min="1">
+                                </div>
+                                <div class="form-group">
+                                    <label>Save Every N Epochs</label>
+                                    <input type="number" id="cfg-save-every" value="1" min="1">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Steps -->
+                        <div id="schedule-steps" class="hidden">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Max Steps</label>
+                                    <input type="number" id="cfg-max-steps" value="1000" min="1">
+                                </div>
+                                <div class="form-group">
+                                    <label>Save Every N Steps</label>
+                                    <input type="number" id="cfg-save-every-steps" value="500" min="1">
+                                </div>
+                            </div>
+                        </div>
+
+
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Output Name</label>
+                                <input type="text" id="cfg-output-name" value="my_anima_lora"
+                                    placeholder="my_anima_lora">
+                            </div>
+                            <div class="form-group">
+                                <label>Save Format</label>
+                                <select id="cfg-save-format">
+                                    <option value="safetensors">Safetensors</option>
+                                    <option value="ckpt">Checkpoint</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <h4>Performance</h4>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Mixed Precision</label>
+                                <select id="cfg-mixed-precision">
+                                    <option value="bf16">BFloat16</option>
+                                    <option value="fp16">Float16</option>
+                                    <option value="no">Float32</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>DataLoader Workers</label>
+                                <input type="number" id="cfg-workers" value="4" min="0" max="16">
+                            </div>
+
+                            <div class="form-group">
+                                <label>GPU Selection</label>
+                                <div id="cfg-gpu-selection" class="gpu-card-grid">
+                                    <small>Loading GPUs...</small>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-gradient-checkpointing" checked> Gradient
+                                Checkpointing</label>
+                            <small>Trades compute for VRAM savings. Recommended on.</small>
+                        </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-flash-attn"> Flash Attention</label>
+                            <small>Requires flash-attn package.</small>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group" style="flex: 1;">
+                                <label><input type="checkbox" id="cfg-lowram"> Low RAM Optimization</label>
+                                <small>Loads model to VRAM to save system RAM.</small>
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label>Blocks to Swap</label>
+                                <input type="number" id="cfg-blocks-to-swap" value="0" min="0" max="24">
+                                <small>Moves parts of model to RAM to save VRAM. 0=Off.</small>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-persistent-workers" checked> Persistent DataLoader
+                                Workers</label>
+                            <small>Keeps workers alive between epochs (less startup lag).</small>
+                        </div>
+
+                        <h4>Caching</h4>
+                        <div class="form-row">
+                            <div class="form-group" style="flex: 1.5;">
+                                <label><input type="checkbox" id="cfg-cache-latents" checked> Cache Latents to
+                                    Disk</label>
+                                <small>Pre-encode images as .npz files for faster training.</small>
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label>VAE Batch Size</label>
+                                <input type="number" id="cfg-vae-batch" value="1" min="1" max="32">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-cache-te" checked> Cache Text Encoder Outputs to
+                                Disk</label>
+                            <small>Pre-encode captions. Required if text encoder is frozen.</small>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Timestep Sample Method</label>
+                                <select id="cfg-timestep-method">
+                                    <option value="logit_normal">Logit Normal</option>
+                                    <option value="uniform">Uniform</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Flow Shift</label>
+                                <input type="number" id="cfg-flow-shift" value="3.0" step="0.1" min="0">
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <!-- Dataset Tab -->
+                    <div id="tab-dataset" class="tab-pane hidden">
+                        <h4>Image Data</h4>
+                        <div class="form-group">
+                            <label>Image Directory</label>
+                            <div style="display: flex; gap: 8px;">
+                                <input type="text" id="cfg-image-dir" placeholder="C:\path\to\images" style="flex: 1;">
+                                <button id="btn-open-image-dir" class="btn btn-secondary"
+                                    title="Open folder">📂</button>
+                            </div>
+                            <small>Folder containing training images and .txt caption files.</small>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Resolution</label>
+                                <input type="number" id="cfg-resolution" value="1536" min="256" step="64">
+                                <small>Max resolution for bucketing (square).</small>
+                            </div>
+                            <div class="form-group">
+                                <label>Batch Size</label>
+                                <input type="number" id="cfg-batch-size" value="4" min="1">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Gradient Accumulation</label>
+                                <input type="number" id="cfg-grad-acc" value="1" min="1" max="128">
+                            </div>
+                            <div class="form-group">
+                                <label>Num Repeats</label>
+                                <input type="number" id="cfg-num-repeats" value="1" min="1">
+                                <small>Repeat dataset N times per epoch.</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Caption Extension</label>
+                                <input type="text" id="cfg-caption-ext" value=".txt" placeholder=".txt">
+                            </div>
+                            <div></div>
+                        </div>
+
+                        <h4>Caption Settings</h4>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Caption Dropout Rate</label>
+                                <input type="number" id="cfg-caption-dropout" value="0.05" step="0.01" min="0" max="1">
+                                <small>Rate to drop entire caption (0-1).</small>
+                            </div>
+                            <div class="form-group">
+                                <label>Tag Dropout Rate</label>
+                                <input type="number" id="cfg-tag-dropout" value="0.05" step="0.01" min="0" max="1">
+                                <small>Rate to drop individual comma-separated tags.</small>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Dropout Every N Epochs</label>
+                            <input type="number" id="cfg-dropout-every-n" value="0" min="0">
+                            <small>Drop all captions every N epochs (0 = disabled).</small>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-shuffle-caption" checked> Shuffle Captions</label>
+                                <small>Shuffle comma-separated tags.</small>
+                            </div>
+                            <div class="form-group">
+                                <label>Keep Tokens</label>
+                                <input type="number" id="cfg-keep-tokens" value="1" min="0">
+                                <small>Keep first N tokens (trigger word) unshuffled.</small>
+                            </div>
+                        </div>
+
+                        <h4>Bucketing</h4>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-enable-bucket" checked> Enable Aspect Ratio
+                                Bucketing</label>
+                            <small>Groups images by aspect ratio for efficient training.</small>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Min Bucket Resolution</label>
+                                <input type="number" id="cfg-min-bucket" value="512" min="64" step="64">
+                            </div>
+                            <div class="form-group">
+                                <label>Max Bucket Resolution</label>
+                                <input type="number" id="cfg-max-bucket" value="1536" min="256" step="64">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Bucket Resolution Steps</label>
+                            <input type="number" id="cfg-bucket-steps" value="64" min="8" step="8">
+                        </div>
+                    </div>
+
+                    <!-- Network Tab -->
+                    <div id="tab-network" class="tab-pane hidden">
+                        <h4>LoRA Configuration</h4>
+                        <div class="form-group">
+                            <label>Network Module</label>
+                            <select id="cfg-network-module">
+                                <option value="networks.lora_anima">LoRA (Anima)</option>
+                                <option value="networks.lora">LoRA (Standard)</option>
+                            </select>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Network Dim (Rank)</label>
+                                <input type="number" id="cfg-network-dim" value="16" min="1">
+                                <small>Higher = more capacity, more VRAM.</small>
+                            </div>
+                            <div class="form-group">
+                                <label>Network Alpha</label>
+                                <input type="number" id="cfg-network-alpha" value="16" min="1">
+                                <small>Scaling factor. Usually same as dim.</small>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-unet-only" checked> Train UNet Only</label>
+                            <small>Freeze text encoder. Recommended for most LoRA training.</small>
+                        </div>
+
+                        <h4>Resume Training</h4>
+                        <div class="form-group">
+                            <label>Resume State Folder</label>
+                            <input type="text" id="cfg-resume" placeholder="C:\path\to\saved_state">
+                            <small>Resume training state (optimizer, scheduler, step count).</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Network Weights (LoRA checkpoint)</label>
+                            <input type="text" id="cfg-network-weights" placeholder="C:\path\to\lora.safetensors">
+                            <small>Initialize from an existing LoRA. Often used for fine-tuning the lora. Usually not
+                                needed.</small>
+                        </div>
+                    </div>
+
+                    <!-- Prompts Tab -->
+                    <div id="tab-prompts" class="tab-pane hidden">
+                        <!-- Sampling Controls -->
+                        <div class="section-card">
+                            <h4>In-Training Sampling</h4>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-enable-sampling" checked> Enable Sampling</label>
+                            </div>
+                            <div id="group-sample-every">
+                                <div class="form-group" id="container-sample-every-epochs">
+                                    <label>Sample Every N Epochs</label>
+                                    <input type="number" id="cfg-sample-every" value="1" min="1">
+                                </div>
+                                <div class="form-group hidden" id="container-sample-every-steps">
+                                    <label>Sample Every N Steps</label>
+                                    <input type="number" id="cfg-sample-every-steps" value="100" min="1">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Generation Controls -->
+                        <div class="section-card">
+                            <h4>Test Generation</h4>
+                            <div class="form-group">
+                                <label>Base Model (No LoRA)</label>
+                                <div style="display: flex; gap: 8px;">
+                                    <select id="gen-lora-select" style="flex: 1;">
+                                        <option value="">Base Model (No LoRA)</option>
+                                    </select>
+                                    <button id="btn-refresh-checkpoints" class="btn btn-secondary"
+                                        title="Refresh Checkpoints">🔄</button>
+                                </div>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>LoRA Strength</label>
+                                    <input type="number" id="gen-lora-mul" value="1.0" step="0.1">
+                                </div>
+                            </div>
+
+                            <div
+                                style="display: flex; justify-content: space-between; align-items: center; margin-top: 20px;">
+                                <div class="checkbox-group">
+                                    <label title="Keep the model loaded in VRAM for faster subsequent generations">
+                                        <input type="checkbox" id="chk-keep-loaded"> Keep Model Loaded
+                                    </label>
+                                </div>
+                                <div style="display: flex; gap: 10px;">
+                                    <button id="btn-unload-model" class="btn btn-danger"
+                                        title="Free VRAM by unloading the generation model">Unload Model</button>
+                                    <button id="btn-gen-sample" class="btn btn-primary"
+                                        style="min-width: 120px;">Generate</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="prompts-header" style="flex-direction: column; align-items: start; gap: 10px;">
+                            <div
+                                style="display: flex; justify-content: space-between; width: 100%; align-items: center;">
+                                <h4>Sample Prompts</h4>
+                                <button id="btn-add-prompt" class="btn btn-primary btn-sm">+ Add Prompt</button>
+                            </div>
+
+                            <!-- Global Settings Bar -->
+                            <div class="global-settings-bar">
+                                <div class="compact-input">
+                                    <label>W</label>
+                                    <input type="number" id="global-w" value="832" step="64">
+                                </div>
+                                <div class="compact-input">
+                                    <label>H</label>
+                                    <input type="number" id="global-h" value="1216" step="64">
+                                </div>
+                                <div class="compact-input">
+                                    <label>Steps</label>
+                                    <input type="number" id="global-s" value="28">
+                                </div>
+                                <div class="compact-input">
+                                    <label>Scale</label>
+                                    <input type="number" id="global-l" value="3.5" step="0.5">
+                                </div>
+                                <div class="compact-input">
+                                    <label>Seed</label>
+                                    <input type="number" id="global-d" value="0">
+                                </div>
+                                <button id="btn-apply-global" class="btn btn-primary btn-xs"
+                                    title="Apply these settings to all prompts below"
+                                    style="margin-left:auto; font-size:0.75rem;">Apply to All</button>
+                            </div>
+                        </div>
+
+                        <div id="prompts-list" class="prompts-list-editable">
+                            <!-- Prompts rendered here -->
+                        </div>
+                        <div id="prompts-empty" class="prompts-empty">
+                            <p>No sample prompts yet. Click "+ Add Prompt" to add one.</p>
+                        </div>
+                    </div>
+
+                    <!-- Samples Tab -->
+                    <div id="tab-samples" class="tab-pane hidden">
+                        <div class="samples-header">
+                            <h4>Generated Samples</h4>
+                            <div class="samples-actions">
+                                <button id="btn-delete-selected" class="btn btn-danger btn-sm hidden">🗑️ Delete
+                                    Selected</button>
+                                <button id="btn-refresh-samples" class="btn btn-ghost btn-sm">🔄 Refresh</button>
+                            </div>
+                        </div>
+                        <div id="samples-grid" class="samples-grid">
+                            <!-- Sample images rendered here -->
+                        </div>
+                        <div id="samples-empty" class="samples-empty">
+                            <p>No sample images yet. They will appear here during training.</p>
+                        </div>
+                    </div>
+
+                    <!-- Console Tab -->
+                    <div id="tab-console" class="tab-pane hidden">
+                        <div class="console-header">
+                            <h4>Training Console</h4>
+                            <button id="btn-clear-console" class="btn btn-ghost btn-sm">Clear</button>
+                        </div>
+                        <pre id="console-output" class="console-output">Waiting for training to start...</pre>
+                    </div>
+
+                    <!-- TensorBoard Tab -->
+                    <div id="tab-tensorboard" class="tab-pane hidden">
+                        <div class="tensorboard-header">
+                            <h4>TensorBoard</h4>
+                            <div style="display:flex; gap:8px; align-items:center;">
+                                <span id="tb-status" class="tb-status">Not running</span>
+                                <button id="btn-tb-launch" class="btn btn-primary btn-sm">🚀 Launch</button>
+                                <button id="btn-tb-stop" class="btn btn-danger btn-sm hidden">⏹ Stop</button>
+                                <button id="btn-tb-open" class="btn btn-ghost btn-sm hidden" title="Open in new tab">↗
+                                    Open</button>
+                            </div>
+                        </div>
+                        <div id="tb-container" class="tb-container">
+                            <div id="tb-placeholder" class="tb-placeholder">
+                                <div class="empty-icon">📊</div>
+                                <h3>TensorBoard</h3>
+                                <p>Click "Launch" to start TensorBoard and view training metrics.</p>
+                                <p><small>Logs directory: <code>&lt;job&gt;/logs/</code></small></p>
+                            </div>
+                            <iframe id="tb-iframe" class="tb-iframe hidden"></iframe>
+                        </div>
+                    </div>
+
+                    <!-- Settings Tab -->
+                    <div id="tab-settings" class="tab-pane hidden">
+                        <h4>Job Maintenance</h4>
+                        <div class="form-group">
+                            <button id="btn-open-folder" class="btn btn-ghost">📂 Open Job Folder</button>
+                            <small>Open the job's directory in file explorer.</small>
+                        </div>
+
+                        <h4>Logging</h4>
+                        <div class="form-group">
+                            <button id="btn-clear-logs" class="btn btn-ghost">🗑️ Clear TensorBoard Logs</button>
+                            <small>Delete all TensorBoard event files for this job.</small>
+                        </div>
+
+                        <h4>Danger Zone</h4>
+                        <div class="form-group danger-zone">
+                            <button id="btn-reset-config" class="btn btn-danger">⚠️ Reset Config to Defaults</button>
+                            <small>Revert all settings to template defaults.</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- New Job Modal -->
+    <div id="modal-new-job" class="modal hidden">
+        <div class="modal-content">
+            <h3>Create New Training Job</h3>
+            <div class="form-group">
+                <label>Job Name</label>
+                <input type="text" id="new-job-name" placeholder="my_job">
+            </div>
+            <div class="modal-actions">
+                <button id="btn-cancel-job" class="btn btn-ghost">Cancel</button>
+                <button id="btn-create-job" class="btn btn-primary">Create</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Clone Job Modal -->
+    <div id="modal-clone-job" class="modal hidden">
+        <div class="modal-content">
+            <h3>Clone Job</h3>
+            <div class="form-group">
+                <label>New Job Name</label>
+                <input type="text" id="clone-job-name" placeholder="e.g. Aemeath_copy">
+            </div>
+            <div class="modal-actions">
+                <button id="btn-cancel-clone" class="btn btn-ghost">Cancel</button>
+                <button id="btn-confirm-clone" class="btn btn-primary">Clone</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirm Modal -->
+    <div id="modal-confirm" class="modal hidden">
+        <div class="modal-content modal-confirm-content">
+            <h3 id="confirm-title">Confirm</h3>
+            <p id="confirm-message">Are you sure?</p>
+            <div class="modal-actions" id="confirm-actions"></div>
+        </div>
+    </div>
+
+    <!-- Global Settings Modal -->
+    <div id="modal-global-settings" class="modal hidden">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3>⚙️ Global Settings</h3>
+                <button id="btn-close-global" class="btn-icon">✕</button>
+            </div>
+
+            <h4>Model Paths</h4>
+            <div class="form-group">
+                <label>DiT Model Path</label>
+                <input type="text" id="cfg-global-dit"
+                    placeholder="C:\Anima\split_files\diffusion_models\anima-preview.safetensors">
+            </div>
+            <div class="form-group">
+                <label>Qwen3 Text Encoder Path</label>
+                <input type="text" id="cfg-global-qwen3"
+                    placeholder="C:\Anima\split_files\text_encoders\qwen_3_06b_base.safetensors">
+            </div>
+            <div class="form-group">
+                <label>VAE Path</label>
+                <input type="text" id="cfg-global-vae"
+                    placeholder="C:\Anima\split_files\vae\qwen_image_vae.safetensors">
+            </div>
+
+            <h4>Environment</h4>
+            <div class="form-group">
+                <label>Python Venv Path</label>
+                <input type="text" id="cfg-global-venv" placeholder="C:\sd-scripts\venv">
+                <small>Path to the Python virtual environment with training dependencies.</small>
+            </div>
+
+            <h4>UI Customization</h4>
+            <div class="form-group">
+                <label>Theme</label>
+                <select id="cfg-theme">
+                    <option value="github-dark">GitHub Dark</option>
+                    <option value="github-light">GitHub Light</option>
+                    <option value="midnight-blue">Midnight Blue</option>
+                    <option value="cherry-pink">Cherry Pink</option>
+                </select>
+            </div>
+
+            <div class="form-group" style="margin-top: 12px;">
+                <label>Background Image</label>
+                <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 8px;">
+                    <input type="file" id="cfg-bg-upload" accept="image/*" style="display: none;">
+                    <button class="btn btn-ghost btn-sm" onclick="document.getElementById('cfg-bg-upload').click()">📁
+                        Choose Image</button>
+                    <button id="btn-remove-bg" class="btn btn-ghost btn-sm hidden"
+                        style="color: var(--danger);">Remove</button>
+                </div>
+                <div id="bg-pos-group" class="hidden">
+                    <label>Positioning (Drag to focal point)</label>
+                    <div id="bg-drag-container" class="bg-drag-container">
+                        <div id="bg-drag-preview" class="bg-drag-preview"></div>
+                        <div id="bg-drag-handle" class="bg-drag-handle"></div>
+                    </div>
+                </div>
+                <div id="bg-visual-controls" class="hidden" style="margin-top: 12px;">
+                    <div class="form-group">
+                        <label>Dim Level (Overlay Opacity): <span id="val-bg-dim">70%</span></label>
+                        <input type="range" id="cfg-bg-dim" min="0" max="100" value="70">
+                    </div>
+                    <div class="form-group" style="margin-top: 8px;">
+                        <label>Image Brightness: <span id="val-bg-brightness">100%</span></label>
+                        <input type="range" id="cfg-bg-brightness" min="50" max="150" value="100">
+                    </div>
+                    <div class="form-group" style="margin-top: 8px;">
+                        <label>Backdrop Blur: <span id="val-bg-blur">10px</span></label>
+                        <input type="range" id="cfg-bg-blur" min="0" max="20" value="10">
+                    </div>
+                    <div class="form-group" style="margin-top: 8px;">
+                        <label>Text Shadow Intensity: <span id="val-text-shadow">0px</span></label>
+                        <input type="range" id="cfg-text-shadow" min="0" max="10" value="0">
+                    </div>
+                </div>
+                <small>Drag the focal point in the preview above. Auto-scales to fit.</small>
+            </div>
+
+            <div class="modal-actions">
+                <button id="btn-save-global" class="btn btn-primary">Save Settings</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Prompt Modal -->
+
+
+    <script src="js/app.js"></script>
+</body>
+
+</html>
