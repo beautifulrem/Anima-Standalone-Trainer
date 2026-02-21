@@ -23,10 +23,10 @@
                         r.style.setProperty('--bg-blur', cfg.blur + 'px');
                         r.style.setProperty('--text-shadow-size', cfg.textShadow + 'px');
 
-                        // Create a temporary style for .app since it doesn't exist yet
                         const s = document.createElement('style');
                         s.id = 'early-bg';
-                        s.innerHTML = `.app { background-image: url('${cfg.url}') !important; background-position: ${cfg.position} !important; } .app::before { display: block !important; }`;
+                        const safeUrl = cfg.url.replace(/['"\\()<>]/g, '');
+                        s.innerHTML = `.app { background-image: url('${safeUrl}') !important; background-position: ${cfg.position} !important; } .app::before { display: block !important; }`;
                         document.head.appendChild(s);
                     }
                 } catch (e) { }

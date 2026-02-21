@@ -120,6 +120,7 @@ async function loadJobs() {
 }
 
 async function selectJob(name) {
+    if (currentJob) savePromptTransientSettings();
     if (isDirty && !confirm('Unsaved changes. Switch anyway?')) return;
     isDirty = false;
 
@@ -622,8 +623,6 @@ function addPrompt() {
         d = Math.floor(Math.random() * 99999) + 1;
     }
 
-    currentPrompts.push({ text: '', w, h, s, l, d, skip: false });
-    renderPrompts();
     currentPrompts.push({ text: '', w, h, s, l, d, skip: false });
     renderPrompts();
     checkDirty();
@@ -1380,9 +1379,6 @@ function navigateGrid(direction, isCtrl) {
         if (!isCtrl) {
             selectSingle(path);
         } else {
-            // In grid nav, simple arrow moves selection. 
-            // Windows Explorer: updates "focus" but not selection if ctrl held?
-            // Simplification: Arrow keys always move selection single unless Shift held (Range)
             selectSingle(path);
         }
         allCards[nextIdx].scrollIntoView({ block: 'nearest' });
@@ -2078,7 +2074,14 @@ $('clone-job-name').addEventListener('keydown', (e) => {
 $('btn-delete').addEventListener('click', () => {
     if (!currentJob) return;
     showConfirm('Delete Job', `Delete "${currentJob}" and all its files? This cannot be undone.`, async () => {
-        await api(`/api/jobs/${currentJob}`, { method: 'DELETE' });
+        const deletedJob = currentJob;
+        await api(`/api/jobs/${deletedJob}`, { method: 'DELETE' });
+
+        // Clean up all localStorage keys for the deleted job
+        localStorage.removeItem(`prompt_transient_${deletedJob}`);
+        localStorage.removeItem(`sample_order_${deletedJob}`);
+        localStorage.removeItem('lastJob');
+
         currentJob = null;
         isDirty = false;
         $('btn-save').classList.add('hidden');
@@ -2121,6 +2124,7 @@ $('btn-run').addEventListener('click', async () => {
 // Generate
 $('btn-gen-sample').addEventListener('click', async () => {
     if (!currentJob) return;
+    savePromptTransientSettings();
     if (isDirty) await saveJob();
 
     if (currentPrompts.length === 0) {
@@ -2313,12 +2317,18 @@ async function init() {
     // Restore Job
     const lastJob = localStorage.getItem('lastJob');
     if (lastJob) {
-        await selectJob(lastJob);
+        const jobExists = Array.from(document.querySelectorAll('.job-item .job-name'))
+            .some(el => el.textContent === lastJob);
+        if (jobExists) {
+            await selectJob(lastJob);
+        } else {
+            localStorage.removeItem('lastJob');
+        }
     }
 
     // Restore Tab
     const lastTab = localStorage.getItem('lastTab');
-    if (lastTab) {
+    if (lastTab && currentJob) {
         const tabEl = document.querySelector(`.tab[data-tab="${lastTab}"]`);
         if (tabEl) tabEl.click();
     }
@@ -2347,3 +2357,4 @@ async function init() {
 
 init();
 
+window.addEventListener('beforeunload', () => savePromptTransientSettings());
