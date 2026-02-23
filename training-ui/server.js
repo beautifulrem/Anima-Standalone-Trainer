@@ -1329,6 +1329,7 @@ app.get('/api/jobs/:name/samples', (req, res) => {
         images.push(...collectImages(outputDir, 'output', req.params.name));
 
         images.sort((a, b) => b.mtime - a.mtime);
+        res.set('Cache-Control', 'no-store');
         res.json(images);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1544,3 +1545,4 @@ async function findAvailablePort(startPort, maxAttempts = 10) {
         }
     });
 })();
+
