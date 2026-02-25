@@ -471,6 +471,9 @@ def sample_images(
     sample_prompts_te_outputs=None,
     prompt_replacement=None,
 ):
+    if not accelerator.is_main_process:
+        return
+        
     """Generate sample images during training.
 
     This is a simplified sampler for Anima - it generates images using the current model state.
@@ -648,7 +651,7 @@ def _sample_image_inference(
 
     except torch.cuda.OutOfMemoryError as e:
         if original_blocks_to_swap and original_blocks_to_swap > 0:
-            logger.warning("OOM. Falling back to block swapping mode")
+            logger.warning("OOM. Falling back to block swapping")
             clean_memory_on_device(accelerator.device)
             
             # Restore block swap early
@@ -667,11 +670,10 @@ def _sample_image_inference(
 
     finally:
         if original_blocks_to_swap and original_blocks_to_swap > 0 and getattr(dit, "blocks_to_swap", 0) == 0:
-            logger.info("Restoring block swap after sampling...")
+            logger.info("Restoring block swap after sampling")
             dit.blocks_to_swap = original_blocks_to_swap
             dit.prepare_block_swap_before_forward()  # Move blocks back to CPU as needed
             clean_memory_on_device(accelerator.device)
-
 
     # Decode latents
     clean_memory_on_device(accelerator.device)
