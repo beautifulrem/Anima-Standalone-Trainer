@@ -6,6 +6,7 @@ let isDirty = false;
 let lastSavedConfig = null;
 let lastSavedDataset = null;
 let lastSavedPrompts = [];
+let lastSavedNegativePrompt = '';
 let samplesPollTimer = null;
 let isDraggingBg = false;
 let bgPosPercent = { x: 50, y: 50 };
@@ -124,6 +125,8 @@ async function loadJobs() {
     });
 }
 
+const DEFAULT_NEGATIVE_PROMPT = 'worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia, low quality, worst quality, blurry, bad anatomy, extra limbs, deformed, watermark, text, signature, bareness, artifacts, hands, copyrights name, jpeg_artifacts, scan_artifacts, bad hands, missing fingers, extra digit, fewer digits, artistic error, ye-pop, deviantart, logo, patreon logo';
+
 async function selectJob(name) {
     if (currentJob) savePromptTransientSettings();
     if (isDirty && !confirm('Unsaved changes. Switch anyway?')) return;
@@ -152,10 +155,17 @@ async function selectJob(name) {
         const status = await api(`/api/jobs/${name}/train/status`);
         updateRunningState(status.running);
 
+        // Set default negative prompt if no saved value exists for this job
+        const savedTransient = localStorage.getItem(`prompt_transient_${name}`);
+        if (!savedTransient || !JSON.parse(savedTransient).negative_prompt) {
+            $('global-negative-prompt').value = DEFAULT_NEGATIVE_PROMPT;
+        }
+
         // Save initial state for dirty checking
         lastSavedConfig = JSON.parse(JSON.stringify(gatherConfig()));
         lastSavedDataset = JSON.parse(JSON.stringify(gatherDataset()));
         lastSavedPrompts = JSON.parse(JSON.stringify(currentPrompts));
+        lastSavedNegativePrompt = $('global-negative-prompt').value;
 
 
         // Subscribe WS
@@ -427,6 +437,7 @@ async function saveJob() {
     lastSavedConfig = JSON.parse(JSON.stringify(config));
     lastSavedDataset = JSON.parse(JSON.stringify(dataset));
     lastSavedPrompts = JSON.parse(JSON.stringify(currentPrompts));
+    lastSavedNegativePrompt = $('global-negative-prompt').value;
 
     checkDirty();
     showToast('Job saved');
@@ -442,8 +453,9 @@ function checkDirty() {
     const configChanged = JSON.stringify(currentConfig) !== JSON.stringify(lastSavedConfig);
     const datasetChanged = JSON.stringify(currentDataset) !== JSON.stringify(lastSavedDataset);
     const promptsChanged = JSON.stringify(currentPrompts) !== JSON.stringify(lastSavedPrompts);
+    const negPromptChanged = ($('global-negative-prompt').value || '') !== (lastSavedNegativePrompt || '');
 
-    isDirty = configChanged || datasetChanged || promptsChanged;
+    isDirty = configChanged || datasetChanged || promptsChanged || negPromptChanged;
 
     if (isDirty) {
         $('btn-save').classList.remove('hidden');
@@ -521,7 +533,12 @@ function parsePromptLine(line) {
 
 function serializePrompt(p) {
     // Reconstruct line
-    const line = `${p.text} --w ${p.w} --h ${p.h} --s ${p.s} --d ${p.d} --l ${p.l}`;
+    let line = `${p.text} --w ${p.w} --h ${p.h} --s ${p.s} --d ${p.d} --l ${p.l}`;
+    // Append global negative prompt
+    const neg = $('global-negative-prompt').value.trim();
+    if (neg) {
+        line += ` --n ${neg}`;
+    }
     return p.skip ? `# ${line}` : line;
 }
 
@@ -689,7 +706,8 @@ function savePromptTransientSettings() {
         global_s: $('global-s').value,
         global_l: $('global-l').value,
         global_d: $('global-d').value,
-        selected_lora: $('gen-lora-select').value
+        selected_lora: $('gen-lora-select').value,
+        negative_prompt: $('global-negative-prompt').value
     };
     localStorage.setItem(`prompt_transient_${currentJob}`, JSON.stringify(settings));
 }
@@ -708,6 +726,7 @@ function loadPromptTransientSettings() {
         if (settings.global_s !== undefined) $('global-s').value = settings.global_s;
         if (settings.global_l !== undefined) $('global-l').value = settings.global_l;
         if (settings.global_d !== undefined) $('global-d').value = settings.global_d;
+        if (settings.negative_prompt !== undefined) $('global-negative-prompt').value = settings.negative_prompt;
         // selected_lora is handled in loadCheckpoints
     } catch (e) { }
 }

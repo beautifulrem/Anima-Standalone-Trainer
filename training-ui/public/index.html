@@ -474,11 +474,22 @@
                             </div>
                         </div>
 
-                        <div class="prompts-header" style="flex-direction: column; align-items: start; gap: 10px;">
+                        <div class="prompts-header" style="flex-direction: column; align-items: stretch; gap: 10px;">
                             <div
                                 style="display: flex; justify-content: space-between; width: 100%; align-items: center;">
                                 <h4>Sample Prompts</h4>
                                 <button id="btn-add-prompt" class="btn btn-primary btn-sm">+ Add Prompt</button>
+                            </div>
+
+                            <!-- Negative Prompt -->
+                            <div class="prompt-card-edit" style="margin-top: 10px; margin-bottom: 5px;">
+                                <div class="prompt-card-header" style="justify-content: flex-start;">
+                                    <label class="skip-label"
+                                        style="font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.8;">Negative
+                                        Prompt</label>
+                                </div>
+                                <textarea id="global-negative-prompt" rows="2"
+                                    placeholder="Enter negative prompt tags..."></textarea>
                             </div>
 
                             <!-- Global Settings Bar -->
