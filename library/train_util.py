@@ -23,8 +23,8 @@ import hashlib
 import subprocess
 from io import BytesIO
 import toml
-
-# from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import concurrent.futures
 
 from tqdm import tqdm
 from packaging.version import Version
@@ -990,26 +990,21 @@ class BaseDataset(torch.utils.data.Dataset):
         min_size and max_size are ignored when enable_bucket is False
         """
         logger.info("loading image sizes.")
-        for info in tqdm(self.image_data.values()):
-            if info.image_size is None:
-                info.image_size = self.get_image_size(info.absolute_path)
+        
+        optimal_workers = max(1, (os.cpu_count() or 2) * 3 // 4)
+        logger.info(f"Using {optimal_workers} workers for image size loading")
 
-        # # run in parallel
-        # max_workers = min(os.cpu_count(), len(self.image_data))  # TODO consider multi-gpu (processes)
-        # with ThreadPoolExecutor(max_workers) as executor:
-        #     futures = []
-        #     for info in tqdm(self.image_data.values(), desc="loading image sizes"):
-        #         if info.image_size is None:
-        #             def get_and_set_image_size(info):
-        #                 info.image_size = self.get_image_size(info.absolute_path)
-        #             futures.append(executor.submit(get_and_set_image_size, info))
-        #             # consume futures to reduce memory usage and prevent Ctrl-C hang
-        #             if len(futures) >= max_workers:
-        #                 for future in futures:
-        #                     future.result()
-        #                 futures = []
-        #     for future in futures:
-        #         future.result()
+        def _get_size(i, info):
+            if info.image_size is None:
+                return i, info, self.get_image_size(info.absolute_path)
+            return i, info, info.image_size
+
+        values_list = list(self.image_data.values())
+        with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+            futures = [executor.submit(_get_size, i, info) for i, info in enumerate(values_list)]
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(values_list), desc="loading image sizes"):
+                i, info, size = future.result()
+                info.image_size = size
 
         if self.enable_bucket:
             logger.info("make buckets")
@@ -2062,23 +2057,33 @@ class DreamBoothDataset(BaseDataset):
                 captions = [meta["caption"] for meta in metas.values()]
                 missing_captions = [img_path for img_path, caption in zip(img_paths, captions) if caption is None or caption == ""]
             else:
-                # 画像ファイルごとにプロンプトを読み込み、もしあればそちらを使う
-                captions = []
+                import concurrent.futures
+                
+                optimal_workers = max(1, (os.cpu_count() or 2) * 3 // 4)
+                logger.info(f"Using {optimal_workers} workers for caption reading")
+
+                captions = [None] * len(img_paths)
                 missing_captions = []
-                for img_path in tqdm(img_paths, desc="read caption"):
-                    cap_for_img = read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
-                    if cap_for_img is None and subset.class_tokens is None:
-                        logger.warning(
-                            f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
-                        )
-                        captions.append("")
-                        missing_captions.append(img_path)
-                    else:
-                        if cap_for_img is None:
-                            captions.append(subset.class_tokens)
+                
+                def _process_caption(i, path):
+                    return i, path, read_caption(path, subset.caption_extension, subset.enable_wildcard)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+                    futures = [executor.submit(_process_caption, i, img_path) for i, img_path in enumerate(img_paths)]
+                    for future in tqdm(concurrent.futures.as_completed(futures), total=len(img_paths), desc="read caption"):
+                        i, img_path, cap_for_img = future.result()
+                        if cap_for_img is None and subset.class_tokens is None:
+                            logger.warning(
+                                f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
+                            )
+                            captions[i] = ""
                             missing_captions.append(img_path)
                         else:
-                            captions.append(cap_for_img)
+                            if cap_for_img is None:
+                                captions[i] = subset.class_tokens
+                                missing_captions.append(img_path)
+                            else:
+                                captions[i] = cap_for_img
 
             self.set_tag_frequency(os.path.basename(subset.image_dir), captions)  # タグ頻度を記録
 

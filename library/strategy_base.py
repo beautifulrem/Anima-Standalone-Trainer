@@ -2,10 +2,13 @@
 
 import os
 import re
+import json
 from typing import Any, List, Optional, Tuple, Union, Callable
 
 import numpy as np
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file as safetensors_save
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 
 
@@ -464,18 +467,38 @@ class LatentsCachingStrategy:
         """
         if not self.cache_to_disk:
             return False
-        if not os.path.exists(npz_path):
+
+        expected_latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
+        key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}" if multi_resolution else ""
+
+        safetensors_path = os.path.splitext(npz_path)[0] + ".safetensors"
+        local_npz_path = os.path.splitext(npz_path)[0] + ".npz"
+
+        if os.path.exists(safetensors_path):
+            if self.skip_disk_cache_validity_check:
+                return True
+            try:
+                with safe_open(safetensors_path, framework="pt") as f:
+                    keys = set(f.keys())
+                    if "latents" + key_reso_suffix not in keys:
+                        return False
+                    if flip_aug and "latents_flipped" + key_reso_suffix not in keys:
+                        return False
+                    if apply_alpha_mask and "alpha_mask" + key_reso_suffix not in keys:
+                        return False
+            except Exception as e:
+                logger.error(f"Error loading file: {safetensors_path}")
+                raise e
+            return True
+
+        if not os.path.exists(local_npz_path):
             return False
+            
         if self.skip_disk_cache_validity_check:
             return True
 
-        expected_latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
-
-        # e.g. "_32x64", HxW
-        key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}" if multi_resolution else ""
-
         try:
-            npz = np.load(npz_path)
+            npz = np.load(local_npz_path)
             if "latents" + key_reso_suffix not in npz:
                 return False
             if flip_aug and "latents_flipped" + key_reso_suffix not in npz:
@@ -483,7 +506,7 @@ class LatentsCachingStrategy:
             if apply_alpha_mask and "alpha_mask" + key_reso_suffix not in npz:
                 return False
         except Exception as e:
-            logger.error(f"Error loading file: {npz_path}")
+            logger.error(f"Error loading file: {local_npz_path}")
             raise e
 
         return True
@@ -601,9 +624,28 @@ class LatentsCachingStrategy:
             latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
             key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}"  # e.g. "_32x64", HxW
 
-        npz = np.load(npz_path)
+        safetensors_path = os.path.splitext(npz_path)[0] + ".safetensors"
+        local_npz_path = os.path.splitext(npz_path)[0] + ".npz"
+
+        if os.path.exists(safetensors_path):
+            with safe_open(safetensors_path, framework="pt") as f:
+                keys = set(f.keys())
+                if "latents" + key_reso_suffix not in keys:
+                    raise ValueError(f"latents{key_reso_suffix} not found in {safetensors_path}")
+
+                latents = f.get_tensor("latents" + key_reso_suffix).float().numpy()
+                flipped_latents = f.get_tensor("latents_flipped" + key_reso_suffix).float().numpy() if "latents_flipped" + key_reso_suffix in keys else None
+                alpha_mask = f.get_tensor("alpha_mask" + key_reso_suffix).float().numpy() if "alpha_mask" + key_reso_suffix in keys else None
+                
+                md = f.metadata()
+                original_size = json.loads(md["original_size" + key_reso_suffix])
+                crop_ltrb = json.loads(md["crop_ltrb" + key_reso_suffix])
+                
+            return latents, original_size, crop_ltrb, flipped_latents, alpha_mask
+
+        npz = np.load(local_npz_path)
         if "latents" + key_reso_suffix not in npz:
-            raise ValueError(f"latents{key_reso_suffix} not found in {npz_path}")
+            raise ValueError(f"latents{key_reso_suffix} not found in {local_npz_path}")
 
         latents = npz["latents" + key_reso_suffix]
         original_size = npz["original_size" + key_reso_suffix].tolist()
@@ -635,20 +677,31 @@ class LatentsCachingStrategy:
         Returns:
             None
         """
-        kwargs = {}
+        safetensors_path = os.path.splitext(npz_path)[0] + ".safetensors"
+        
+        tensors = {}
+        metadata = {}
 
-        if os.path.exists(npz_path):
-            # load existing npz and update it
-            npz = np.load(npz_path)
-            for key in npz.files:
-                kwargs[key] = npz[key]
+        if os.path.exists(safetensors_path):
+            # load existing safetensors and update it
+            try:
+                with safe_open(safetensors_path, framework="pt") as f:
+                    for key in f.keys():
+                        tensors[key] = f.get_tensor(key)
+                    for key, val in f.metadata().items():
+                        metadata[key] = val
+            except Exception:
+                pass # If it fails, we just overwrite
 
-        # TODO float() is needed if vae is in bfloat16. Remove it if vae is float16.
-        kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()
-        kwargs["original_size" + key_reso_suffix] = np.array(original_size)
-        kwargs["crop_ltrb" + key_reso_suffix] = np.array(crop_ltrb)
+        # Use bfloat16 for latents to save space and match newer models
+        # Use float16 for alpha_mask
+        tensors["latents" + key_reso_suffix] = latents_tensor.to(torch.bfloat16).contiguous().cpu()
+        metadata["original_size" + key_reso_suffix] = json.dumps(original_size)
+        metadata["crop_ltrb" + key_reso_suffix] = json.dumps(crop_ltrb)
+        
         if flipped_latents_tensor is not None:
-            kwargs["latents_flipped" + key_reso_suffix] = flipped_latents_tensor.float().cpu().numpy()
+            tensors["latents_flipped" + key_reso_suffix] = flipped_latents_tensor.to(torch.bfloat16).contiguous().cpu()
         if alpha_mask is not None:
-            kwargs["alpha_mask" + key_reso_suffix] = alpha_mask.float().cpu().numpy()
-        np.savez(npz_path, **kwargs)
+            tensors["alpha_mask" + key_reso_suffix] = alpha_mask.to(torch.float16).contiguous().cpu()
+            
+        safetensors_save(tensors, safetensors_path, metadata=metadata)
