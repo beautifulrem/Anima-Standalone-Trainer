@@ -1002,7 +1002,7 @@ class BaseDataset(torch.utils.data.Dataset):
         values_list = list(self.image_data.values())
         with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
             futures = [executor.submit(_get_size, i, info) for i, info in enumerate(values_list)]
-            for future in tqdm(concurrent.futures.as_completed(futures), total=len(values_list), desc="loading image sizes"):
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(values_list), desc="loading image sizes", disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0"):
                 i, info, size = future.result()
                 info.image_size = size
 
@@ -1163,7 +1163,7 @@ class BaseDataset(torch.utils.data.Dataset):
         try:
             # iterate images
             logger.info("caching latents...")
-            for i, info in enumerate(tqdm(image_infos)):
+            for i, info in enumerate(tqdm(image_infos, disable=not accelerator.is_main_process)):
                 subset = self.image_to_subset[info.image_key]
 
                 if info.latents_npz is not None:  # fine tuning dataset
@@ -1244,7 +1244,7 @@ class BaseDataset(torch.utils.data.Dataset):
         current_condition = None
 
         logger.info("checking cache validity...")
-        for info in tqdm(image_infos):
+        for info in tqdm(image_infos, disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0"):
             subset = self.image_to_subset[info.image_key]
 
             if info.latents_npz is not None:  # fine tuning dataset
@@ -1286,7 +1286,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         # iterate batches: batch doesn't have image, image will be loaded in cache_batch_latents and discarded
         logger.info("caching latents...")
-        for condition, batch in tqdm(batches, smoothing=1, total=len(batches)):
+        for condition, batch in tqdm(batches, smoothing=1, total=len(batches), disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0"):
             cache_batch_latents(vae, cache_to_disk, batch, condition.flip_aug, condition.alpha_mask, condition.random_crop)
 
     def new_cache_text_encoder_outputs(self, models: List[Any], accelerator: Accelerator):
@@ -1310,7 +1310,7 @@ class BaseDataset(torch.utils.data.Dataset):
         process_index = accelerator.process_index
 
         logger.info("checking cache validity...")
-        for i, info in enumerate(tqdm(image_infos)):
+        for i, info in enumerate(tqdm(image_infos, disable=not accelerator.is_main_process)):
             # check disk cache exists and size of text encoder outputs
             if caching_strategy.cache_to_disk:
                 te_out_npz = caching_strategy.get_outputs_npz_path(info.absolute_path)
@@ -1341,7 +1341,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         # iterate batches
         logger.info("caching Text Encoder outputs...")
-        for batch in tqdm(batches, smoothing=1, total=len(batches)):
+        for batch in tqdm(batches, smoothing=1, total=len(batches), disable=not accelerator.is_main_process):
             # cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
             caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
 
@@ -1397,7 +1397,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         logger.info("checking cache existence...")
         image_infos_to_cache = []
-        for info in tqdm(image_infos):
+        for info in tqdm(image_infos, disable=not is_main_process):
             # subset = self.image_to_subset[info.image_key]
             if cache_to_disk:
                 te_out_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
@@ -1444,7 +1444,7 @@ class BaseDataset(torch.utils.data.Dataset):
         # iterate batches: call text encoder and cache outputs for memory or disk
         logger.info("caching text encoder outputs...")
         if not is_sd3:
-            for batch in tqdm(batches):
+            for batch in tqdm(batches, disable=not is_main_process):
                 infos, input_ids1, input_ids2 = zip(*batch)
                 input_ids1 = torch.stack(input_ids1, dim=0)
                 input_ids2 = torch.stack(input_ids2, dim=0)
@@ -1452,7 +1452,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     infos, tokenizers, text_encoders, self.max_token_length, cache_to_disk, input_ids1, input_ids2, output_dtype
                 )
         else:
-            for batch in tqdm(batches):
+            for batch in tqdm(batches, disable=not is_main_process):
                 infos, l_tokens, g_tokens, t5_tokens = zip(*batch)
 
                 # stack tokens
@@ -2007,7 +2007,7 @@ class DreamBoothDataset(BaseDataset):
                     npz_path_index = 0
 
                     size_set_count = 0
-                    for i, img_path in enumerate(tqdm(img_paths)):
+                    for i, img_path in enumerate(tqdm(img_paths, disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0")):
                         l = len(os.path.splitext(img_path)[0])  # remove extension
                         found = False
                         while npz_path_index < len(npz_paths):  # until found or end of npz_paths
@@ -2070,7 +2070,7 @@ class DreamBoothDataset(BaseDataset):
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
                     futures = [executor.submit(_process_caption, i, img_path) for i, img_path in enumerate(img_paths)]
-                    for future in tqdm(concurrent.futures.as_completed(futures), total=len(img_paths), desc="read caption"):
+                    for future in tqdm(concurrent.futures.as_completed(futures), total=len(img_paths), desc="read caption", disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0"):
                         i, img_path, cap_for_img = future.result()
                         if cap_for_img is None and subset.class_tokens is None:
                             logger.warning(
@@ -2103,7 +2103,7 @@ class DreamBoothDataset(BaseDataset):
 
             if not use_cached_info_for_subset and subset.cache_info:
                 logger.info(f"cache image info for / 画像情報をキャッシュします : {info_cache_file}")
-                sizes = [self.get_image_size(img_path) for img_path in tqdm(img_paths, desc="get image size")]
+                sizes = [self.get_image_size(img_path) for img_path in tqdm(img_paths, desc="get image size", disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0")]
                 matas = {}
                 for img_path, caption, size in zip(img_paths, captions, sizes):
                     matas[img_path] = {"caption": caption, "resolution": list(size)}

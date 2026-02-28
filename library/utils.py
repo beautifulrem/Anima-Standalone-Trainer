@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 import threading
 from typing import *
@@ -53,6 +54,13 @@ def setup_logging(args=None, log_level=None, reset=False):
     if log_level is None:
         log_level = "INFO"
     log_level = getattr(logging, log_level)
+
+    # In multi-GPU setup, only setup logging on the main process to avoid duplicate logs
+    # We check common environment variables for rank
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    if rank != 0:
+        logging.root.setLevel(logging.ERROR) # suppress logs on other processes
+        return
 
     msg_init = None
     if args is not None and args.console_log_file:
