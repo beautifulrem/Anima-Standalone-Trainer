@@ -3,9 +3,6 @@
 
 # Anima Standalone Trainer
 
-> [!IMPORTANT]
-> **🚀 v1.1.0 Update:** We just replaced all legacy `.npz` caching with ultra-fast `safetensors` and introduced multi-threaded dataset loading. Run `git pull` immediately to cut your startup and caching times by up to 10x!
-
 A lightweight, decoupled training environment for circlestone-labs' Anima model, currently support Lora training only. Windows only, Linux compatibility is in work. Built upon [sd-scripts](https://github.com/kohya-ss/sd-scripts) implementation.
 
 <img width="2554" height="1234" alt="image" src="https://github.com/user-attachments/assets/cb5ff930-ce8c-49d6-a77a-3da393fe719d" />
