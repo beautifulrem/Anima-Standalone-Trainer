@@ -1,3 +1,6 @@
+[IMPORTANT]
+> ** v1.1.0 Update: Improve caching and others I/O performance. Fix multi-GPU support on Windows with DPP. Check for more information below. Please consider update asap**
+
 # Anima Standalone Trainer
 
 A lightweight, decoupled training environment for circlestone-labs' Anima model, currently support Lora training only. Windows only, Linux compatibility is in work. Built upon [sd-scripts](https://github.com/kohya-ss/sd-scripts) implementation.
@@ -49,7 +52,11 @@ Once launched, open your browser to: `http://localhost:3000`
 
 **v1.1.0. Improving caching and others I/O performance.**
 
-Important performance release, please consider update
+## Multi-GPUs
+
+Tested on torch2.7+cu128 with [this fix](https://github.com/pytorch/pytorch/pull/175316) applied on Windows when encountered **libuv** error.
+
+Seems to works best with torch<=2.3 and cuda <= 12.4 without directly applying the fix.
 
 ## Update
 
@@ -63,7 +70,7 @@ git pull
 
 Some features and settings from sd-scripts may not be available or working properly at the momment.
 
-Multi-GPU and Linux are not tested.
+Linux are not tested.
 
 Built and tested on Windows 11, 1x RTX 3090, CUDA 13.1, Pytorch 2.10 
 
