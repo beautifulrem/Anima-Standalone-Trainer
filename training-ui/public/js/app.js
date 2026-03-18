@@ -303,6 +303,8 @@ function populateConfig(config) {
     $('cfg-unet-only').checked = n.network_train_unet_only ?? true;
     $('cfg-network-weights').value = n.network_weights || '';
     $('cfg-resume').value = n.resume || '';
+    $('cfg-network-dropout').value = n.network_dropout ?? 0;
+    $('cfg-network-args').value = (n.network_args || []).join(' ');
 }
 
 function populateDataset(dataset) {
@@ -346,6 +348,9 @@ function populateDataset(dataset) {
     if (currentSubsets.length === 0) {
         addSubset(false);
     }
+
+    // Alpha mask: check if any subset has it enabled
+    $('cfg-alpha-mask').checked = subsetsRaw.some(s => s.alpha_mask === true);
 
     renderSubsets();
 }
@@ -430,6 +435,8 @@ function gatherConfig() {
             network_dim: safeInt($('cfg-network-dim').value),
             network_alpha: safeInt($('cfg-network-alpha').value),
             network_train_unet_only: $('cfg-unet-only').checked,
+            ...((safeFloat($('cfg-network-dropout').value) > 0) && { network_dropout: safeFloat($('cfg-network-dropout').value) }),
+            ...(($('cfg-network-args').value.trim()) && { network_args: $('cfg-network-args').value.trim().split(/\s+/) }),
             ...(($('cfg-network-weights').value) && { network_weights: $('cfg-network-weights').value }),
             ...(($('cfg-resume').value) && { resume: $('cfg-resume').value })
         },
@@ -460,17 +467,21 @@ function gatherDataset() {
             resolution: [res, res],
             batch_size: safeInt($('cfg-batch-size').value),
             caption_extension: $('cfg-caption-ext').value,
-            subsets: currentSubsets.map(s => ({
-                image_dir: s.image_dir,
-                num_repeats: safeInt(s.num_repeats),
-                keep_tokens: safeInt(s.keep_tokens),
-                flip_aug: s.flip_aug,
-                caption_prefix: s.caption_prefix,
-                caption_dropout_rate: safeFloat(s.caption_dropout_rate),
-                caption_tag_dropout_rate: safeFloat(s.caption_tag_dropout_rate),
-                caption_dropout_every_n_epochs: safeInt(s.caption_dropout_every_n_epochs),
-                shuffle_caption: s.shuffle_caption
-            }))
+            subsets: currentSubsets.map(s => {
+                const subset = {
+                    image_dir: s.image_dir,
+                    num_repeats: safeInt(s.num_repeats),
+                    keep_tokens: safeInt(s.keep_tokens),
+                    flip_aug: s.flip_aug,
+                    caption_prefix: s.caption_prefix,
+                    caption_dropout_rate: safeFloat(s.caption_dropout_rate),
+                    caption_tag_dropout_rate: safeFloat(s.caption_tag_dropout_rate),
+                    caption_dropout_every_n_epochs: safeInt(s.caption_dropout_every_n_epochs),
+                    shuffle_caption: s.shuffle_caption
+                };
+                if ($('cfg-alpha-mask').checked) subset.alpha_mask = true;
+                return subset;
+            })
         }]
     };
 }
@@ -2533,12 +2544,7 @@ $('btn-gen-sample').addEventListener('click', async () => {
         alert(result.error);
         return;
     }
-    // updateRunningState(true); // Don't block 'Train' button for generation
-    // consoleOutput.textContent = ...; // Don't wipe console!
     appendConsole(`Starting generation...\n${loraPath ? `Using LoRA: ${loraPath} (x${payload.network_mul})` : '(Using base model)'}\nFlow Shift: ${payload.flow_shift}\n\n`);
-
-    // Auto-switch to console tab -> REMOVED per user request
-    // document.querySelector('[data-tab="console"]').click();
     showToast('Generation started');
 });
 
