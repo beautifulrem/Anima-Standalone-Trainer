@@ -262,9 +262,18 @@
                             </div>
                             <div class="form-group" style="flex: 1;">
                                 <label>Blocks to Swap</label>
-                                <input type="number" id="cfg-blocks-to-swap" value="0" min="0" max="24">
-                                <small>Moves parts of model to RAM to save VRAM. 0=Off.</small>
+                                <input type="number" id="cfg-blocks-to-swap" value="0" min="0" max="26">
+                                <small>Moves transformer blocks to RAM to save VRAM. 0=Off.</small>
                             </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Activation Offload</label>
+                            <select id="cfg-activation-offload">
+                                <option value="none">None</option>
+                                <option value="cpu">CPU Offload (blocking transfers)</option>
+                                <option value="unsloth">Unsloth Offload (async, faster)</option>
+                            </select>
+                            <small>Offloads activations to CPU during backward pass. Requires Gradient Checkpointing. Incompatible with Blocks to Swap.</small>
                         </div>
 
 

@@ -269,6 +269,15 @@ function populateConfig(config) {
     $('cfg-torch-compile').checked = t.torch_compile ?? false;
     $('cfg-lowram').checked = t.lowram ?? false;
     $('cfg-blocks-to-swap').value = t.blocks_to_swap ?? 0;
+    // Activation offload mode
+    if (t.unsloth_offload_checkpointing) {
+        $('cfg-activation-offload').value = 'unsloth';
+    } else if (t.cpu_offload_checkpointing) {
+        $('cfg-activation-offload').value = 'cpu';
+    } else {
+        $('cfg-activation-offload').value = 'none';
+    }
+    updateActivationOffloadUI();
     $('cfg-persistent-workers').checked = t.persistent_data_loader_workers ?? true;
     $('cfg-cache-latents').checked = t.cache_latents_to_disk ?? true;
     $('cfg-vae-batch').value = t.vae_batch_size ?? 1;
@@ -361,6 +370,20 @@ function updateOptimizerOptions() {
     $('group-decouple').classList.toggle('hidden', !isProdigy);
 }
 
+function updateActivationOffloadUI() {
+    const offload = $('cfg-activation-offload').value;
+    const blocksInput = $('cfg-blocks-to-swap');
+    const isOffload = offload !== 'none';
+    blocksInput.disabled = isOffload;
+    if (isOffload) {
+        blocksInput.value = 0;
+    }
+    // Auto-enable gradient checkpointing when offload is selected
+    if (isOffload) {
+        $('cfg-gradient-checkpointing').checked = true;
+    }
+}
+
 // Helpers for safe parsing
 function safeInt(val, fallback = 0) {
     if (val === '' || val === null || val === undefined) return fallback;
@@ -424,6 +447,8 @@ function gatherConfig() {
             torch_compile: $('cfg-torch-compile').checked,
             lowram: $('cfg-lowram').checked,
             blocks_to_swap: safeInt($('cfg-blocks-to-swap').value),
+            ...($('cfg-activation-offload').value === 'cpu' && { cpu_offload_checkpointing: true }),
+            ...($('cfg-activation-offload').value === 'unsloth' && { unsloth_offload_checkpointing: true }),
             persistent_data_loader_workers: $('cfg-persistent-workers').checked,
             seed: safeInt($('cfg-seed').value),
             cache_latents_to_disk: $('cfg-cache-latents').checked,
@@ -2683,6 +2708,9 @@ async function init() {
 
     // Optimizer custom bindings
     $('cfg-optimizer').addEventListener('change', updateOptimizerOptions);
+
+    // Activation offload <-> blocks to swap mutual exclusivity
+    $('cfg-activation-offload').addEventListener('change', updateActivationOffloadUI);
 
     // Discard Button
     $('btn-discard').addEventListener('click', discardChanges);
