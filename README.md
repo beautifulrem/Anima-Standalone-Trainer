@@ -1,5 +1,5 @@
 [IMPORTANT]
-> ** v2.0.0 Update: Adding preliminary Linux support. Adding multi-gpu, flash attention and sage attention for significant inference speed up. Please consider update asap**
+> ** v2.1.0 Update: Adding Lumina Lora Training**
 
 # Anima Standalone Trainer
 
@@ -38,8 +38,8 @@ Run the provided setup script for your operating system:
 
 *This will create a virtual environment (`venv`), install all Python dependencies (assuming you have met the prereqisites), and set up the Web UI.*
 
-This script will probably install a pytorch with CPU only.
-Depends on your system, you may want to install a specific version of Pytorch with CUDA.
+This script will probably install Torch and Torchvision version below.
+Depends on your system, you may want to install another version of Pytorch with CUDA.
 
 ```cmd
 pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
