@@ -5448,7 +5448,7 @@ def prepare_accelerator(args: argparse.Namespace):
     if os.name == "nt" and "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
         import torch.distributed as dist
         if not dist.is_initialized():
-            os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+            os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "127.0.0.1")
             os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
             os.environ["USE_LIBUV"] = "0"
             rank = int(os.environ.get("RANK", "0"))
