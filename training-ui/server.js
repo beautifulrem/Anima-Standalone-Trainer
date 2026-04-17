@@ -752,28 +752,87 @@ app.put('/api/jobs/:name/prompts', (req, res) => {
 });
 
 let persistentGenProcess = null; // { process, port, jobName }
-const GEN_SERVER_PORT = 5000; // Fixed port for now, or dynamic
+const GEN_SERVER_PORT = 5000; // Fixed port for now
 
-// Cross-platform process killer
-function killProcess(pid) {
-    return new Promise((resolve) => {
+// Kill all running jobs when the Node server itself exits
+function killAllJobs() {
+    for (const [, job] of runningJobs) {
+        if (job.pid) {
+            try {
+                if (process.platform === 'win32') {
+                    require('child_process').execSync(
+                        `taskkill /PID ${job.pid} /F /T`, { stdio: 'ignore' });
+                } else {
+                    try { process.kill(-job.pid, 'SIGKILL'); } catch (_) {
+                        try { process.kill(job.pid, 'SIGKILL'); } catch (__) {}
+                    }
+                }
+            } catch (_) {}
+        }
+    }
+    if (persistentGenProcess && persistentGenProcess.process) {
+        const pid = persistentGenProcess.process.pid;
         try {
             if (process.platform === 'win32') {
-                const k = spawn('taskkill', ['/PID', pid.toString(), '/F', '/T']);
-                k.on('close', () => resolve());
-                k.on('error', () => resolve());
+                require('child_process').execSync(
+                    `taskkill /PID ${pid} /F /T`, { stdio: 'ignore' });
             } else {
-                // Linux/Mac: kill -9
-                try {
-                    process.kill(pid, 'SIGKILL');
-                    resolve();
-                } catch (e) {
-                    resolve();
+                try { process.kill(-pid, 'SIGKILL'); } catch (_) {
+                    try { process.kill(pid, 'SIGKILL'); } catch (__) {}
                 }
             }
-        } catch (e) {
-            resolve();
+        } catch (_) {}
+    }
+}
+
+for (const sig of ['exit', 'SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+        killAllJobs();
+        if (sig !== 'exit') process.exit(0);
+    });
+}
+
+// Cross-platform process killer.
+function killProcess(pid, gracefulMs = 8000) {
+    return new Promise((resolve) => {
+        if (process.platform === 'win32') {
+            // taskkill /T kills the entire process tree on Windows.
+            const k = spawn('taskkill', ['/PID', pid.toString(), '/F', '/T']);
+            k.on('close', () => resolve());
+            k.on('error', () => resolve());
+            return;
         }
+
+        // Linux/Mac: kill the entire process group
+        const groupKill = (sig) => {
+            try { process.kill(-pid, sig); } catch (_) {
+                try { process.kill(pid, sig); } catch (__) {}
+            }
+        };
+
+        if (gracefulMs <= 0) {
+            groupKill('SIGKILL');
+            resolve();
+            return;
+        }
+
+        // SIGTERM → give the training script a chance to flush the last checkpoint
+        groupKill('SIGTERM');
+
+        const timer = setTimeout(() => {
+            groupKill('SIGKILL');
+            resolve();
+        }, gracefulMs);
+
+        const poll = setInterval(() => {
+            try {
+                process.kill(pid, 0); // throws if pid is gone
+            } catch (_) {
+                clearInterval(poll);
+                clearTimeout(timer);
+                resolve();
+            }
+        }, 200);
     });
 }
 
@@ -818,7 +877,8 @@ function spawnShell(script, cwd) {
     } else {
         return spawn('bash', ['-c', script], {
             cwd,
-            stdio: ['pipe', 'pipe', 'pipe']
+            stdio: ['pipe', 'pipe', 'pipe'],
+            detached: true
         });
     }
 }
@@ -865,13 +925,13 @@ app.post('/api/jobs/:name/train/stop', async (req, res) => {
             return res.status(400).json({ error: 'Job not running' });
         }
 
-        // Kill the process tree
+        runningJobs.delete(jobName);
+        broadcastStatus(jobName, 'stopping');
+
         if (job.pid) {
-            await killProcess(job.pid);
+            killProcess(job.pid, 8000).catch(() => {});
         }
 
-        runningJobs.delete(jobName);
-        broadcastStatus(jobName, 'idle');
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1215,6 +1275,14 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
 
         // Build merged config and write to temp file
         const mergedConfig = buildTrainingConfig(jobName, jobPath);
+
+        // TP/SP: strip options that are incompatible with the TP training script.
+        const launchMode = mergedConfig.training_arguments?.multigpu_mode
+            || (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp');
+        if (launchMode === 'tp_sp' && mergedConfig.training_arguments) {
+            delete mergedConfig.training_arguments.save_state;
+        }
+
         const mergedConfigPath = path.join(jobPath, '_merged_config.toml');
         fs.writeFileSync(mergedConfigPath, TOML.stringify(mergedConfig), 'utf8');
 
@@ -1233,6 +1301,12 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         let gpuEnv = '';
         let currentGpuIds = '';
         let accelerateFlags = '';
+        let tpTrainCmd = null; // set when TP/SP mode is active
+
+        // Resolve architecture
+        const jobArch = getArchForJob(mergedConfig);
+        const hasNetwork = !!(mergedConfig.network_arguments && mergedConfig.network_arguments.network_module);
+
         try {
             const rawConfig = TOML.parse(fs.readFileSync(configPath, 'utf8'));
             currentGpuIds = rawConfig.gpu_ids ? rawConfig.gpu_ids.toString().trim() : '';
@@ -1263,9 +1337,55 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
                 const mixedPrec = mergedConfig.training_arguments?.mixed_precision || 'bf16';
 
                 if (validIds.length > 1) {
-                    if (mergedConfig.training_arguments?.use_fsdp) {
-                        // FSDP Support (Mutually exclusive with --multi_gpu)
-                        accelerateFlags = `--use_fsdp --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+                    // Resolve mode: explicit multigpu_mode takes priority, fallback to use_fsdp for compat
+                    const multiGpuMode = mergedConfig.training_arguments?.multigpu_mode
+                        || (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp');
+
+                    if (multiGpuMode === 'tp_sp') {
+                        // TP/SP: torchrun instead of accelerate launch, dedicated script.
+                        const tpScript = jobArch.scripts?.train_network_tp_sp;
+                        if (!tpScript) {
+                            return res.status(400).json({
+                                error: `TP/SP mode is not supported for the "${jobArch.id || 'current'}" architecture. No train_network_tp_sp script is defined.`
+                            });
+                        }
+                        const tpDegree = validIds.length;
+                        const useSeqParallel = mergedConfig.training_arguments?.sequence_parallel ?? false;
+                        const tpTargetScript = path.join(ROOT_DIR, tpScript);
+                        tpTrainCmd = `python -m torch.distributed.run --nproc_per_node=${tpDegree} --master_addr 127.0.0.1 --master_port 29500 "${tpTargetScript}" --tp_degree ${tpDegree}${useSeqParallel ? ' --sequence_parallel' : ''} --config_file="${mergedConfigPath}"`;
+                    } else if (multiGpuMode === 'fsdp2') {
+                        // FSDP2 — PyTorch fully_shard API (accelerate >= 0.34, PyTorch >= 2.4)
+                        const t2 = mergedConfig.training_arguments;
+                        accelerateFlags = `--use_fsdp --fsdp_version 2 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+                        // reshard_after_forward is a bool in FSDP2
+                        const reshard2 = t2.fsdp2_reshard_after_forward ?? true;
+                        accelerateFlags += ` --fsdp_reshard_after_forward ${reshard2 ? 'true' : 'false'}`;
+                        if (t2.fsdp2_cpu_ram_efficient_loading) {
+                            accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
+                        }
+                        if (t2.fsdp2_offload_params) {
+                            accelerateFlags += ` --fsdp_offload_params true`;
+                        }
+                        if (t2.fsdp2_activation_checkpointing) {
+                            accelerateFlags += ` --fsdp_activation_checkpointing true`;
+                        }
+                        if (t2.fsdp2_auto_wrap_policy && t2.fsdp2_auto_wrap_policy !== 'NO_WRAP') {
+                            accelerateFlags += ` --fsdp_auto_wrap_policy ${t2.fsdp2_auto_wrap_policy}`;
+                        }
+                        if (t2.fsdp2_auto_wrap_policy === 'SIZE_BASED_WRAP' && t2.fsdp2_min_num_params) {
+                            accelerateFlags += ` --fsdp_min_num_params ${t2.fsdp2_min_num_params}`;
+                        }
+                        if (t2.fsdp2_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
+                            const userCls = (t2.fsdp2_transformer_layer_cls_to_wrap || '').trim();
+                            const archCls = getArchForJob(mergedConfig).fsdp_transformer_cls || '';
+                            const clsToWrap = userCls || archCls;
+                            if (clsToWrap) {
+                                accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${clsToWrap}"`;
+                            }
+                        }
+                    } else if (multiGpuMode === 'fsdp' || mergedConfig.training_arguments?.use_fsdp) {
+                        // FSDP1 — classic FullyShardedDataParallel API
+                        accelerateFlags = `--use_fsdp --fsdp_version 1 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
                         accelerateFlags += ` --fsdp_sharding_strategy ${mergedConfig.training_arguments.fsdp_sharding_strategy || 1}`;
                         // cpu_ram_efficient_loading: only rank 0 loads from disk, others receive via broadcast.
                         // accelerate requires sync_module_states=true alongside it — emit both together.
@@ -1321,16 +1441,24 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             }
         }
 
-        // torch.compile support
-        if (mergedConfig.training_arguments?.torch_compile) {
+        // torch.compile support (not compatible with TP/SP or FSDP2 — skip for those modes)
+        const resolvedMode = mergedConfig.training_arguments?.multigpu_mode
+            || (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp');
+        if (mergedConfig.training_arguments?.torch_compile && resolvedMode !== 'tp_sp' && resolvedMode !== 'fsdp2') {
             accelerateFlags += ' --dynamo_backend inductor';
         }
 
-        // Determine target script from architecture registry
-        const jobArch = getArchForJob(mergedConfig);
-        const hasNetwork = !!(mergedConfig.network_arguments && mergedConfig.network_arguments.network_module);
-        const scriptName = hasNetwork ? jobArch.scripts.train_network : jobArch.scripts.train;
-        const targetScript = path.join(ROOT_DIR, scriptName);
+        // Build the launch command
+        let trainCmd;
+        if (resolvedMode === 'tp_sp' && tpTrainCmd) {
+            // TP/SP: use the torchrun command built in the GPU block above
+            trainCmd = tpTrainCmd;
+        } else {
+            // DDP / FSDP: standard accelerate launch
+            const scriptName = hasNetwork ? jobArch.scripts.train_network : jobArch.scripts.train;
+            const targetScript = path.join(ROOT_DIR, scriptName);
+            trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${targetScript}" --config_file="${mergedConfigPath}"`;
+        }
 
         // Spawn training process
         const isMultiGpu = currentGpuIds && currentGpuIds.split(',').map(s => s.trim()).filter(s => s.length > 0).length > 1;
@@ -1343,7 +1471,6 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             (isWindows && isMultiGpu) ? buildEnvVar('MASTER_ADDR', '127.0.0.1') : '',
             (isWindows && isMultiGpu) ? buildEnvVar('MASTER_PORT', '29500') : ''
         ].filter(Boolean).join('\n');
-        const trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${targetScript}" --config_file="${mergedConfigPath}"`;
         const trainScript = buildShellScript(venv.activate, trainEnvVars, trainCmd);
 
         const scriptPath = path.join(jobPath, isWindows ? 'launch_command.ps1' : 'launch_command.sh');
