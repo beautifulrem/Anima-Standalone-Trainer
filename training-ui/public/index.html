@@ -448,9 +448,13 @@
 
                         <h4>Resume Training</h4>
                         <div class="form-group">
+                            <label><input type="checkbox" id="cfg-auto-resume"> Auto-resume from last saved state</label>
+                            <small>Automatically resumes from the most recent saved state in the output folder.</small>
+                        </div>
+                        <div class="form-group">
                             <label>Resume State Folder</label>
                             <input type="text" id="cfg-resume" placeholder="C:\path\to\saved_state">
-                            <small>Resume training state (optimizer, scheduler, step count).</small>
+                            <small>Resume training state (optimizer, scheduler, step count). Leave blank when auto-resume is enabled.</small>
                         </div>
                         <div class="form-group">
                             <label>Network Weights (LoRA checkpoint)</label>
@@ -610,14 +614,26 @@
                         </div>
                         
                         <hr style="margin: 20px 0; border: 0; border-top: 1px solid var(--border);">
-                        
+
                         <h4>Multi-GPU Optimization</h4>
-                        <div id="group-cuda-direct" class="form-group disabled-section">
-                            <label><input type="checkbox" id="cfg-use-cuda-direct"> Use CUDA Direct Backend</label>
-                            <small>Highly experimental and unstable. Use the custom CUDA Direct Backend for native windows multi-gpu training with better performance. Required CUDA Direct Backend package. Currently incompatible with Torch Compile.</small>
+
+                        <div id="group-multigpu-mode" class="form-group disabled-section">
+                            <label style="font-weight: 600;">Parallelism Mode</label>
+                            <select id="cfg-multigpu-mode">
+                                <option value="ddp">DDP — Data Parallel (standard)</option>
+                                <option value="fsdp">FSDP1 — Fully Sharded Data Parallel v1</option>
+                                <option value="fsdp2">FSDP2 — Fully Sharded Data Parallel v2 (Linux only)</option>
+                                <option value="tp_sp" style="display:none">TP/SP — Tensor + Sequence Parallel</option>
+                            </select>
+                            <small>DDP replicates the full model on each GPU and syncs gradients. FSDP1/FSDP2 shard parameters to reduce VRAM (FSDP2 is the newer, simpler API).</small>
                         </div>
 
-                        <div id="group-ddp-opts" class="form-group disabled-section" style="margin-top: 20px;">
+                        <div id="group-cuda-direct" class="form-group disabled-section" style="margin-top: 16px;">
+                            <label><input type="checkbox" id="cfg-use-cuda-direct"> Use CUDA Direct Backend</label>
+                            <small>Windows-only custom backend replacing NCCL for native multi-GPU. Auto-detected in TP/SP mode. Incompatible with Torch Compile.</small>
+                        </div>
+
+                        <div id="group-ddp-opts" class="form-group hidden" style="margin-top: 20px;">
                             <label style="font-weight: 600;">DDP Options</label>
                             <div style="margin-top: 10px;">
                                 <label title="Gradient tensors become views into the all-reduce communication buffer instead of copies. Reduces peak memory and eliminates one copy per step. Safe to always enable for DDP."><input type="checkbox" id="cfg-ddp-gradient-as-bucket-view"> Gradient as Bucket View</label>
@@ -629,11 +645,10 @@
                             </div>
                         </div>
 
-                        <div id="group-fsdp" class="form-group disabled-section" style="margin-top: 20px;">
-                            <label><input type="checkbox" id="cfg-use-fsdp"> Enable FSDP (Fully Sharded Data Parallel)</label>
-                            <small>Shards model parameters across GPUs to fit larger architectures in VRAM. Leave unchecked for standard DDP.</small>
-                            
-                            <div id="fsdp-settings" class="hidden" style="margin-left: 20px; margin-top: 15px; display: flex; flex-direction: column; gap: 15px; padding-left: 15px; border-left: 2px solid var(--border);">
+                        <div id="group-fsdp" class="form-group hidden" style="margin-top: 20px;">
+                            <input type="checkbox" id="cfg-use-fsdp" style="display:none;">
+
+                            <div id="fsdp-settings" style="margin-top: 4px; display: flex; flex-direction: column; gap: 15px;">
                                 <div class="form-group">
                                     <label>Sharding Strategy</label>
                                     <select id="cfg-fsdp-sharding-strategy">
@@ -714,6 +729,78 @@
                                     <input type="text" id="cfg-fsdp-layer-to-wrap" placeholder="e.g. Block">
                                     <small>The exact class name of the transformer block. Required for TRANSFORMER_BASED_WRAP.</small>
                                 </div>
+                            </div>
+                        </div>
+
+                        <!-- FSDP2 Settings — shown when Parallelism Mode = FSDP2 -->
+                        <div id="group-fsdp2" class="form-group hidden" style="margin-top: 20px;">
+                            <div style="margin-bottom: 12px; padding: 10px 12px; background: rgba(255,180,0,0.12); border-left: 3px solid #f0a500; border-radius: 4px; font-size: 0.82rem; line-height: 1.5;">
+                                <strong>Linux only.</strong> This is not available on Windows.
+                            </div>
+                            <div id="fsdp2-settings" style="margin-top: 4px; display: flex; flex-direction: column; gap: 15px;">
+
+                                <div class="form-group">
+                                    <label><input type="checkbox" id="cfg-fsdp2-reshard-after-forward" checked> Reshard After Forward</label>
+                                    <small>When enabled (default), frees unsharded parameters after each forward pass and re-all-gathers them in backward. Maximizes VRAM savings. Disable to keep parameters unsharded between forward and backward — saves one backward all-gather at the cost of higher VRAM.</small>
+                                </div>
+
+                                <div class="form-group">
+                                    <label><input type="checkbox" id="cfg-fsdp2-offload-params"> CPU Offloading</label>
+                                    <small>Moves sharded parameters and gradients to CPU when not in use. Drastically reduces VRAM at the cost of H2D/D2H copy overhead per step.</small>
+                                </div>
+
+                                <div class="form-group">
+                                    <label><input type="checkbox" id="cfg-fsdp2-activation-checkpointing"> Activation Checkpointing</label>
+                                    <small>Frees intermediate activations during forward and recomputes them in backward. Reduces VRAM at the cost of extra compute. Combine with Reshard After Forward for maximum VRAM savings.</small>
+                                </div>
+
+                                <div class="form-group">
+                                    <label><input type="checkbox" id="cfg-fsdp2-cpu-ram-efficient-loading"> CPU RAM Efficient Loading</label>
+                                    <small>Only rank 0 loads the model checkpoint; other ranks receive weights via broadcast. Reduces peak system RAM by ~50% during startup.</small>
+                                </div>
+
+                                <div class="form-group">
+                                    <label>Auto Wrap Policy</label>
+                                    <select id="cfg-fsdp2-auto-wrap-policy">
+                                        <option value="NO_WRAP">NO_WRAP — Wrap root module only</option>
+                                        <option value="TRANSFORMER_BASED_WRAP">TRANSFORMER_BASED_WRAP — Wrap per transformer block</option>
+                                        <option value="SIZE_BASED_WRAP">SIZE_BASED_WRAP — Wrap modules above a parameter threshold</option>
+                                    </select>
+                                    <small>Determines how FSDP2 groups parameters into sharded units. TRANSFORMER_BASED_WRAP is recommended for large DiT/UNet models: each transformer block is all-gathered and reduce-scattered independently, enabling communication/computation overlap.</small>
+                                </div>
+
+                                <div class="form-group hidden" id="fsdp2-size-wrap-group">
+                                    <label>Parameters Threshold</label>
+                                    <input type="number" id="cfg-fsdp2-min-num-params" placeholder="100000000" value="100000000">
+                                    <small>Only shards modules with at least this many parameters. Default is 100M (1e8).</small>
+                                </div>
+
+                                <div class="form-group hidden" id="fsdp2-layer-wrap-group">
+                                    <label>Transformer Layer to Wrap</label>
+                                    <input type="text" id="cfg-fsdp2-layer-to-wrap" placeholder="e.g. Block">
+                                    <small>Exact class name of the transformer block to wrap per-layer. Required for TRANSFORMER_BASED_WRAP.</small>
+                                </div>
+
+                                <div style="margin-top: 4px; padding: 10px; background: var(--bg-secondary); border-radius: 4px; border-left: 3px solid var(--accent); font-size: 0.8rem; line-height: 1.5;">
+                                    <strong>FSDP2 vs FSDP1:</strong> FSDP2 uses <code>torch.distributed.fsdp.fully_shard</code> (PyTorch ≥ 2.4). Parameters are always exposed as originals (no FlatParameter), making it compatible with LoRA. Backward prefetch, forward prefetch, and limit-all-gathers are handled automatically. Sharding strategy is replaced by the single Reshard After Forward toggle.
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- TP/SP Settings — shown when Parallelism Mode = TP/SP -->
+                        <div id="group-tp-sp" class="form-group hidden" style="margin-top: 20px;">
+                            <label style="font-weight: 600;">TP/SP Options</label>
+                            <div style="margin-top: 12px;">
+                                <label>TP Degree</label>
+                                <input type="number" id="cfg-tp-degree" value="2" min="2" max="8" style="width:80px;">
+                                <small>Number of GPUs for tensor parallelism. Must equal the number of selected GPUs above.</small>
+                            </div>
+                            <div style="margin-top: 12px;">
+                                <label title="Splits the token sequence across TP ranks in addition to weight sharding. Halves activation memory per GPU at the cost of two extra collectives per block."><input type="checkbox" id="cfg-sequence-parallel"> Enable Sequence Parallel (SP)</label>
+                                <small>Splits spatial tokens across GPUs alongside weight sharding. Reduces activation memory by ~half per GPU. Adds 2 all-gathers per DiT block.</small>
+                            </div>
+                            <div style="margin-top: 12px; padding: 10px; background: var(--bg-secondary); border-radius: 4px; border-left: 3px solid var(--accent); font-size: 0.8rem; line-height: 1.5;">
+                                <strong>TP/SP notes:</strong> All standard training configs (LR, batch size, optimizer, network dim, etc.) work. Sample generation during training is disabled. CUDA Direct backend is auto-detected. Torch Compile is incompatible.
                             </div>
                         </div>
 

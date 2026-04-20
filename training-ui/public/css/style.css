@@ -1606,6 +1606,11 @@ input:disabled, select:disabled {
     background: var(--warning);
 }
 
+.hw-bar-power {
+    background: var(--danger);
+    opacity: 0.8;
+}
+
 .hw-metric-value {
     font-size: 0.71rem;
     color: var(--text-primary);

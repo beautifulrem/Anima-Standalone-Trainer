@@ -154,6 +154,8 @@ function updateHwMonitor(stats) {
       const activityBadge = gpu.activity
         ? `<span class="hw-activity-badge">${gpu.activity}</span>`
         : "";
+      const powerPct = gpu.powerLimit > 0 ? Math.round((gpu.powerDraw / gpu.powerLimit) * 100) : 0;
+      const powerLabel = gpu.powerLimit > 0 ? `${gpu.powerDraw}W / ${gpu.powerLimit}W` : `${gpu.powerDraw}W`;
       html += `<div class="hw-section hw-section-gpu${activeClass}">
                 <div class="hw-section-header">
                     <span class="hw-section-title">GPU ${gpu.index}</span>
@@ -169,6 +171,11 @@ function updateHwMonitor(stats) {
                     <span class="hw-metric-label">VRAM</span>
                     <div class="hw-bar-wrap"><div class="hw-bar hw-bar-vram" style="width:${vramPct}%"></div></div>
                     <span class="hw-metric-value">${vramPct}% &nbsp;${vramUsed} / ${vramTotal} GB</span>
+                </div>
+                <div class="hw-row">
+                    <span class="hw-metric-label">Power</span>
+                    <div class="hw-bar-wrap"><div class="hw-bar hw-bar-power" style="width:${powerPct}%"></div></div>
+                    <span class="hw-metric-value">${powerLabel}</span>
                 </div>
             </div>`;
     });
@@ -197,7 +204,7 @@ function updateHwMonitor(stats) {
         ch += `<div class="hw-compact-sep"></div>
                 <div class="hw-compact-item">
                     <span class="hw-compact-label">GPU ${gpu.index}</span>
-                    <span>${gpuPct}% · ${vramUsed}/${vramTotal}GB · <span class="hw-temp ${tempClass}">${gpu.temp}°C</span>${badge}</span>
+                    <span>${gpuPct}% · ${vramUsed}/${vramTotal}GB · ${gpu.powerDraw}W · <span class="hw-temp ${tempClass}">${gpu.temp}°C</span>${badge}</span>
                 </div>`;
       });
     }
@@ -412,8 +419,13 @@ function populateConfig(config) {
   $("cfg-ddp-gradient-as-bucket-view").checked =
     t.ddp_gradient_as_bucket_view ?? false;
   $("cfg-ddp-static-graph").checked = t.ddp_static_graph ?? false;
-  // FSDP restoring
-  $("cfg-use-fsdp").checked = t.use_fsdp ?? false;
+  // Multi-GPU mode selector (ddp/fsdp/fsdp2/tp_sp) — backward compat: infer from use_fsdp
+  const restoredMode = t.multigpu_mode || (t.use_fsdp ? "fsdp" : "ddp");
+  $("cfg-multigpu-mode").value = restoredMode;
+  applyMultiGpuMode(restoredMode);
+  // TP/SP options
+  if (t.tp_degree) $("cfg-tp-degree").value = t.tp_degree;
+  $("cfg-sequence-parallel").checked = t.sequence_parallel ?? false;
   $("cfg-fsdp-sharding-strategy").value = t.fsdp_sharding_strategy || "1";
   $("cfg-fsdp-offload-params").checked = t.fsdp_offload_params ?? false;
   $("cfg-fsdp-reshard-after-forward").checked =
@@ -430,7 +442,7 @@ function populateConfig(config) {
   $("cfg-fsdp-min-num-params").value = t.fsdp_min_num_params || "100000000";
   $("cfg-fsdp-layer-to-wrap").value =
     t.fsdp_transformer_layer_cls_to_wrap || "";
-  $("fsdp-settings").classList.toggle("hidden", !$("cfg-use-fsdp").checked);
+  // fsdp-settings is always visible when group-fsdp is shown (mode dropdown controls visibility)
   $("fsdp-layer-wrap-group").classList.toggle(
     "hidden",
     $("cfg-fsdp-auto-wrap-policy").value !== "TRANSFORMER_BASED_WRAP",
@@ -438,6 +450,22 @@ function populateConfig(config) {
   $("fsdp-size-wrap-group").classList.toggle(
     "hidden",
     $("cfg-fsdp-auto-wrap-policy").value !== "SIZE_BASED_WRAP",
+  );
+  // FSDP2 restore
+  $("cfg-fsdp2-reshard-after-forward").checked = t.fsdp2_reshard_after_forward ?? true;
+  $("cfg-fsdp2-offload-params").checked = t.fsdp2_offload_params ?? false;
+  $("cfg-fsdp2-activation-checkpointing").checked = t.fsdp2_activation_checkpointing ?? false;
+  $("cfg-fsdp2-cpu-ram-efficient-loading").checked = t.fsdp2_cpu_ram_efficient_loading ?? false;
+  $("cfg-fsdp2-auto-wrap-policy").value = t.fsdp2_auto_wrap_policy || "NO_WRAP";
+  $("cfg-fsdp2-min-num-params").value = t.fsdp2_min_num_params || "100000000";
+  $("cfg-fsdp2-layer-to-wrap").value = t.fsdp2_transformer_layer_cls_to_wrap || "";
+  $("fsdp2-layer-wrap-group").classList.toggle(
+    "hidden",
+    $("cfg-fsdp2-auto-wrap-policy").value !== "TRANSFORMER_BASED_WRAP",
+  );
+  $("fsdp2-size-wrap-group").classList.toggle(
+    "hidden",
+    $("cfg-fsdp2-auto-wrap-policy").value !== "SIZE_BASED_WRAP",
   );
   $("cfg-step-profile").checked = t.step_profile ?? false;
   $("cfg-profile-microbatch").checked = t.profile_microbatch ?? false;
@@ -472,7 +500,9 @@ function populateConfig(config) {
   $("cfg-network-alpha").value = n.network_alpha ?? 16;
   $("cfg-unet-only").checked = n.network_train_unet_only ?? true;
   $("cfg-network-weights").value = n.network_weights || "";
+  $("cfg-auto-resume").checked = n.auto_resume_last_state ?? false;
   $("cfg-resume").value = n.resume || "";
+  $("cfg-resume").disabled = $("cfg-auto-resume").checked;
   $("cfg-network-dropout").value = n.network_dropout ?? 0;
   $("cfg-network-args").value = (n.network_args || []).join(" ");
 }
@@ -645,6 +675,17 @@ function gatherConfig() {
       ...($("cfg-disable-bucket-shuffle").checked && {
         disable_bucket_shuffle: true,
       }),
+      multigpu_mode:
+        document.querySelectorAll('input[name="gpu-select"]:checked').length > 1
+          ? $("cfg-multigpu-mode").value
+          : "ddp",
+      ...($("cfg-multigpu-mode").value === "tp_sp" &&
+        document.querySelectorAll('input[name="gpu-select"]:checked').length > 1
+          ? {
+              tp_degree: safeInt($("cfg-tp-degree").value) || 2,
+              sequence_parallel: $("cfg-sequence-parallel").checked,
+            }
+          : {}),
       use_cuda_direct:
         document.querySelectorAll('input[name="gpu-select"]:checked').length > 1
           ? $("cfg-use-cuda-direct").checked
@@ -660,7 +701,7 @@ function gatherConfig() {
       // FSDP Configs
       use_fsdp:
         document.querySelectorAll('input[name="gpu-select"]:checked').length > 1
-          ? $("cfg-use-fsdp").checked
+          ? ($("cfg-multigpu-mode").value === "fsdp" || $("cfg-multigpu-mode").value === "fsdp2")
           : false,
       fsdp_sharding_strategy: $("cfg-fsdp-sharding-strategy").value,
       fsdp_offload_params: $("cfg-fsdp-offload-params").checked,
@@ -678,6 +719,14 @@ function gatherConfig() {
       fsdp_transformer_layer_cls_to_wrap: $(
         "cfg-fsdp-layer-to-wrap",
       ).value.trim(),
+      // FSDP2 Configs
+      fsdp2_reshard_after_forward: $("cfg-fsdp2-reshard-after-forward").checked,
+      fsdp2_offload_params: $("cfg-fsdp2-offload-params").checked,
+      fsdp2_activation_checkpointing: $("cfg-fsdp2-activation-checkpointing").checked,
+      fsdp2_cpu_ram_efficient_loading: $("cfg-fsdp2-cpu-ram-efficient-loading").checked,
+      fsdp2_auto_wrap_policy: $("cfg-fsdp2-auto-wrap-policy").value,
+      fsdp2_min_num_params: safeInt($("cfg-fsdp2-min-num-params").value),
+      fsdp2_transformer_layer_cls_to_wrap: $("cfg-fsdp2-layer-to-wrap").value.trim(),
       // Diagnostics
       step_profile: $("cfg-step-profile").checked,
       profile_microbatch: $("cfg-profile-microbatch").checked,
@@ -708,7 +757,8 @@ function gatherConfig() {
       ...($("cfg-network-weights").value && {
         network_weights: $("cfg-network-weights").value,
       }),
-      ...($("cfg-resume").value && { resume: $("cfg-resume").value }),
+      auto_resume_last_state: $("cfg-auto-resume").checked,
+      ...($("cfg-resume").value && !$("cfg-auto-resume").checked && { resume: $("cfg-resume").value }),
     },
     anima_arguments: {
       timestep_sample_method: $("cfg-timestep-method").value,
@@ -1021,6 +1071,12 @@ function discardChanges() {
 $("cfg-step-profile").addEventListener("change", (e) => {
   $("cfg-profile-microbatch-group").style.display = e.target.checked ? "" : "none";
   if (!e.target.checked) $("cfg-profile-microbatch").checked = false;
+});
+
+// Disable manual resume path when auto-resume is enabled
+$("cfg-auto-resume").addEventListener("change", (e) => {
+  $("cfg-resume").disabled = e.target.checked;
+  if (e.target.checked) $("cfg-resume").value = "";
 });
 
 // Mark dirty on any input change
@@ -2536,36 +2592,52 @@ async function loadGPUs() {
     container.innerHTML = `<small style="color:red">Error: ${err.message}</small>`;
   }
 }
-function updateMultiGPUUI() {
-  const group = $("group-cuda-direct");
-  const toggle = $("cfg-use-cuda-direct");
-  const fsdpGroup = $("group-fsdp");
+// Show the correct mode panel, hide the others.
+// Panels use only the "hidden" class for visibility — no disabled-section.
+function applyMultiGpuMode(mode) {
+  const ddpGroup   = $("group-ddp-opts");
+  const fsdpGroup  = $("group-fsdp");
+  const fsdp2Group = $("group-fsdp2");
+  const tpGroup    = $("group-tp-sp");
+  if (!ddpGroup || !fsdpGroup || !tpGroup) return;
+
+  ddpGroup.classList.toggle("hidden",   mode !== "ddp");
+  fsdpGroup.classList.toggle("hidden",  mode !== "fsdp");
+  if (fsdp2Group) fsdp2Group.classList.toggle("hidden", mode !== "fsdp2");
+  tpGroup.classList.toggle("hidden",    mode !== "tp_sp");
+
+  // Keep hidden checkbox in sync so reconcileFSDPConflicts still works
   const fsdpToggle = $("cfg-use-fsdp");
-  const ddpOptsGroup = $("group-ddp-opts");
-  if (!group || !toggle) return;
-  const count = document.querySelectorAll(
-    'input[name="gpu-select"]:checked',
-  ).length;
+  if (fsdpToggle) fsdpToggle.checked = (mode === "fsdp" || mode === "fsdp2");
+}
+
+function updateMultiGPUUI() {
+  const modeGroup   = $("group-multigpu-mode");
+  const cudaGroup   = $("group-cuda-direct");
+  const cudaToggle  = $("cfg-use-cuda-direct");
+  if (!cudaGroup || !cudaToggle) return;
+
+  const count = document.querySelectorAll('input[name="gpu-select"]:checked').length;
+
   if (count > 1) {
-    group.classList.remove("disabled-section");
-    if (fsdpGroup) {
-      fsdpGroup.classList.remove("disabled-section");
-    }
-    if (ddpOptsGroup) ddpOptsGroup.classList.remove("disabled-section");
+    if (modeGroup) modeGroup.classList.remove("disabled-section");
+    cudaGroup.classList.remove("disabled-section");
+    // Keep tp_degree in sync with actual GPU count — the server uses GPU count
+    // directly, so this just keeps the display honest.
+    const tpDegreeInput = $("cfg-tp-degree");
+    if (tpDegreeInput) tpDegreeInput.value = count;
+    applyMultiGpuMode($("cfg-multigpu-mode")?.value || "ddp");
   } else {
-    group.classList.add("disabled-section");
-    toggle.checked = false;
-    if (fsdpGroup) {
-      fsdpGroup.classList.add("disabled-section");
-      if (fsdpToggle) fsdpToggle.checked = false;
-      if ($("fsdp-settings")) $("fsdp-settings").classList.add("hidden");
-    }
-    if (ddpOptsGroup) {
-      ddpOptsGroup.classList.add("disabled-section");
-      if ($("cfg-ddp-gradient-as-bucket-view"))
-        $("cfg-ddp-gradient-as-bucket-view").checked = false;
-      if ($("cfg-ddp-static-graph")) $("cfg-ddp-static-graph").checked = false;
-    }
+    // Single GPU — disable mode selector and cuda-direct, hide all panels
+    if (modeGroup) modeGroup.classList.add("disabled-section");
+    cudaGroup.classList.add("disabled-section");
+    cudaToggle.checked = false;
+    ["group-ddp-opts", "group-fsdp", "group-fsdp2", "group-tp-sp"].forEach(id => {
+      const el = $(id);
+      if (el) el.classList.add("hidden");
+    });
+    const fsdpToggle = $("cfg-use-fsdp");
+    if (fsdpToggle) fsdpToggle.checked = false;
   }
 }
 // Global state for restoring manual offloading values
@@ -2657,12 +2729,15 @@ document.addEventListener("DOMContentLoaded", () => {
     fsdpInfo.innerHTML =
       strategyMap[strategySelect.value] || "Select a strategy to see details.";
   };
-  if (fsdpToggle) {
-    fsdpToggle.addEventListener("change", () => {
-      $("fsdp-settings").classList.toggle("hidden", !fsdpToggle.checked);
+  // Multi-GPU mode selector
+  const modeSelect = $("cfg-multigpu-mode");
+  if (modeSelect) {
+    modeSelect.addEventListener("change", (e) => {
+      applyMultiGpuMode(e.target.value);
       reconcileFSDPConflicts();
     });
   }
+  // fsdpToggle is a hidden input
   if (cudaDirectToggle) {
     cudaDirectToggle.addEventListener("change", reconcileFSDPConflicts);
     // Auto Wrap Policy visibility toggle
@@ -2676,6 +2751,19 @@ document.addEventListener("DOMContentLoaded", () => {
         e.target.value !== "SIZE_BASED_WRAP",
       );
     });
+    const fsdp2WrapPolicy = $("cfg-fsdp2-auto-wrap-policy");
+    if (fsdp2WrapPolicy) {
+      fsdp2WrapPolicy.addEventListener("change", (e) => {
+        $("fsdp2-layer-wrap-group").classList.toggle(
+          "hidden",
+          e.target.value !== "TRANSFORMER_BASED_WRAP",
+        );
+        $("fsdp2-size-wrap-group").classList.toggle(
+          "hidden",
+          e.target.value !== "SIZE_BASED_WRAP",
+        );
+      });
+    }
   }
   // Manual value tracking: Update "last known" value when user changes it MANUALLY
   if (blocksInput) {

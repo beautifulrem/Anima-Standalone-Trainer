@@ -1896,16 +1896,23 @@ function getCpuTemp() {
     });
 }
 
+let gpuStatsPending = false;
+
 function getGpuStats() {
+    if (gpuStatsPending) return Promise.resolve(null);
+    gpuStatsPending = true;
     return new Promise((resolve) => {
         const smi = spawn('nvidia-smi', [
-            '--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu',
+            '--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit',
             '--format=csv,noheader,nounits'
         ]);
+        const timer = setTimeout(() => { smi.kill(); gpuStatsPending = false; resolve(null); }, 3000);
         let stdout = '';
         smi.stdout.on('data', d => stdout += d);
         smi.on('close', (code) => {
-            if (code !== 0 || !stdout.trim()) return resolve([]);
+            clearTimeout(timer);
+            gpuStatsPending = false;
+            if (code !== 0 || !stdout.trim()) return resolve(null);
             try {
                 const gpus = stdout.trim().split('\n').map(line => {
                     const parts = line.split(',').map(s => s.trim());
@@ -1915,15 +1922,17 @@ function getGpuStats() {
                         util: parseInt(parts[2]) || 0,
                         memUsed: parseInt(parts[3]) || 0,
                         memTotal: parseInt(parts[4]) || 0,
-                        temp: parseInt(parts[5]) || 0
+                        temp: parseInt(parts[5]) || 0,
+                        powerDraw: Math.round(parseFloat(parts[6])) || 0,
+                        powerLimit: Math.round(parseFloat(parts[7])) || 0
                     };
                 });
                 resolve(gpus);
             } catch (e) {
-                resolve([]);
+                resolve(null);
             }
         });
-        smi.on('error', () => resolve([]));
+        smi.on('error', () => { clearTimeout(timer); gpuStatsPending = false; resolve(null); });
     });
 }
 
@@ -1934,6 +1943,8 @@ setInterval(async () => {
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
     const [gpus, cpuTemp] = await Promise.all([getGpuStats(), getCpuTemp()]);
+
+    if (gpus === null) return; // nvidia-smi busy or timed out — skip this tick
 
     // Mark active GPUs from running jobs
     const activeGpus = {};
@@ -1970,7 +1981,7 @@ setInterval(async () => {
             client.send(payload);
         }
     });
-}, 2000);
+}, 1000);
 
 // Prevent server crash on unhandled errors
 process.on('uncaughtException', (err) => {
