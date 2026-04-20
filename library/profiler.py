@@ -1,6 +1,7 @@
 from tqdm import tqdm
 import time
 import torch
+import torch.distributed as dist
 
 class StepProfiler:
     def __init__(self, accelerator, enabled=False, profile_microbatch=False):
@@ -36,15 +37,29 @@ class StepProfiler:
         self._avg_ar_ms  = 0.0  # allreduce
         self._avg_a2a_ms = 0.0  # alltoall
 
-        # Memory snapshot: when set to a step number, records one step's
-        # full allocation history and dumps to a .pickle file for
-        # pytorch.org/memory_viz
+        # Memory snapshot
         self._snapshot_step = None
+
+        # Resolve world size and rank from torch.distributed when available.
+        # This handles TP/SP mode where the Accelerator is in NO distributed
+        # mode (num_processes=1) but dist IS initialized across TP ranks, and
+        # where process_index is spoofed to 0 on all ranks so that
+        # accelerator.is_main_process / num_processes can't be trusted.
+        try:
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                self._world_size = dist.get_world_size()
+                self._is_rank0   = dist.get_rank() == 0
+            else:
+                self._world_size = accelerator.num_processes
+                self._is_rank0   = accelerator.is_main_process
+        except Exception:
+            self._world_size = accelerator.num_processes
+            self._is_rank0   = accelerator.is_main_process
 
         # CommTimer: auto-detected from the default process group if using
         # cuda_direct backend on multi-GPU. None on single GPU or other backends.
         self._comm_timer = None
-        if enabled and accelerator.num_processes > 1:
+        if enabled and self._world_size > 1:
             try:
                 import torch.distributed.distributed_c10d as _c10d
                 _pg = _c10d._get_default_group()
@@ -161,15 +176,27 @@ class StepProfiler:
             ms_wall, ms_fwd, ms_bwd, ms_comm, ms_opt, _mb(self._peak_vram),
             ag_ms, rs_ms, ar_ms, a2a_ms,
         ], device=self.accelerator.device)
-        gathered = self.accelerator.gather(metrics)  # shape: [world_size * 10]
-        # Discard the allgather fired by accelerator.gather() above so it doesn't
-        # bleed into the next step's drain() as a spurious allgather event.
+
+        # Gather per-rank metrics. Use dist.all_gather directly when dist is
+        # initialized so this works in TP/SP mode (accelerator is in NO mode
+        # and its .gather() is a no-op that returns only the local tensor).
+        try:
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                gather_list = [torch.zeros_like(metrics) for _ in range(self._world_size)]
+                dist.all_gather(gather_list, metrics)
+                gathered = torch.cat(gather_list)
+            else:
+                gathered = self.accelerator.gather(metrics)
+        except Exception:
+            gathered = self.accelerator.gather(metrics)
+
+        # Discard the allgather fired above so it doesn't bleed into the next
         if self._comm_timer is not None:
             self._comm_timer.drain()
 
-        if self.accelerator.is_main_process:
+        if self._is_rank0:
             N = 10
-            num_ranks = self.accelerator.num_processes
+            num_ranks = self._world_size
             rank_data = [gathered[i*N : (i+1)*N].tolist() for i in range(num_ranks)]
 
             # Running average: mean across ranks then accumulate.

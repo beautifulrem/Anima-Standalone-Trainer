@@ -1032,54 +1032,96 @@ class NetworkTrainer:
         else:
             from accelerate.utils import DistributedType
             is_fsdp = accelerator.distributed_type == DistributedType.FSDP
+            is_fsdp2 = getattr(accelerator, "is_fsdp2", False)
 
-            if train_unet:
-                # default implementation is:  unet = accelerator.prepare(unet)
-                unet = self.prepare_unet_with_accelerator(args, accelerator, unet)  # accelerator does some magic here
-            elif is_fsdp:
-                # FSDP: wrap the frozen UNet so its parameters are SHARDED across GPUs.
-                # Without this, each GPU holds a full copy (same as DDP) and FSDP saves no VRAM.
+            if is_fsdp2:
                 if self.cast_unet(args):
                     unet.to(dtype=unet_weight_dtype)
-                unet = self.prepare_unet_with_accelerator(args, accelerator, unet)
-            else:
-                # Standard DDP: move to device because unet is not prepared by accelerator
-                unet.to(accelerator.device, dtype=unet_weight_dtype if self.cast_unet(args) else None)
-
-            if train_text_encoder:
-                text_encoders = [
-                    (accelerator.prepare(t_enc) if flag else t_enc)
-                    for t_enc, flag in zip(text_encoders, self.get_text_encoders_train_flags(args, text_encoders))
-                ]
-                if len(text_encoders) > 1:
-                    text_encoder = text_encoders
-                else:
-                    text_encoder = text_encoders[0]
-            elif is_fsdp:
-                # FSDP: wrap frozen text encoders so they are sharded too.
-                # Guard: skip encoders already on CPU (e.g. after output caching).
-                text_encoders = [
-                    accelerator.prepare(t_enc) if t_enc.device.type != "cpu" else t_enc
-                    for t_enc in text_encoders
-                ]
-                if len(text_encoders) > 1:
-                    text_encoder = text_encoders
-                else:
-                    text_encoder = text_encoders[0]
-            else:
-                pass  # if text_encoder is not trained, no need to prepare. and device and dtype are already set
-
-            # When FSDP is active, the LoRA network must NOT be wrapped by FSDP.
-            if is_fsdp:
                 network.to(accelerator.device)
-                optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-                    optimizer, train_dataloader, val_dataloader, lr_scheduler
+
+                # Collect models to shard: unet + text encoders that are on GPU.
+                # Text encoders cached to disk (on CPU) are skipped.
+                te_flags = self.get_text_encoders_train_flags(args, text_encoders)
+                tes_for_fsdp2 = [
+                    te for te in text_encoders if te.device.type != "cpu"
+                ]
+
+                for _m in [unet] + list(tes_for_fsdp2):
+                    if not hasattr(_m, "_no_split_modules"):
+                        _m._no_split_modules = []
+
+                # One combined prepare call: all models + optimizer + dataloaders
+                prepared = accelerator.prepare(
+                    unet, *tes_for_fsdp2, optimizer, train_dataloader, val_dataloader, lr_scheduler
                 )
+                n_tes = len(tes_for_fsdp2)
+                unet = prepared[0]
+                # Unpack prepared text encoders back into text_encoders list
+                te_gpu_iter = iter(prepared[1 : 1 + n_tes])
+                text_encoders = [
+                    next(te_gpu_iter) if te.device.type != "cpu" else te
+                    for te in text_encoders
+                ]
+                optimizer        = prepared[1 + n_tes]
+                train_dataloader = prepared[2 + n_tes]
+                val_dataloader   = prepared[3 + n_tes]
+                lr_scheduler     = prepared[4 + n_tes]
+
+                if len(text_encoders) > 1:
+                    text_encoder = text_encoders
+                else:
+                    text_encoder = text_encoders[0]
+                training_model = network
+
             else:
-                network, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-                    network, optimizer, train_dataloader, val_dataloader, lr_scheduler
-                )
-            training_model = network
+                # FSDP1 and DDP: original prepare logic (unchanged).
+                if train_unet:
+                    # default implementation is:  unet = accelerator.prepare(unet)
+                    unet = self.prepare_unet_with_accelerator(args, accelerator, unet)  # accelerator does some magic here
+                elif is_fsdp:
+                    # FSDP1: wrap the frozen UNet so its parameters are SHARDED across GPUs.
+                    # Without this, each GPU holds a full copy (same as DDP) and FSDP saves no VRAM.
+                    if self.cast_unet(args):
+                        unet.to(dtype=unet_weight_dtype)
+                    unet = self.prepare_unet_with_accelerator(args, accelerator, unet)
+                else:
+                    # Standard DDP: move to device because unet is not prepared by accelerator
+                    unet.to(accelerator.device, dtype=unet_weight_dtype if self.cast_unet(args) else None)
+
+                if train_text_encoder:
+                    text_encoders = [
+                        (accelerator.prepare(t_enc) if flag else t_enc)
+                        for t_enc, flag in zip(text_encoders, self.get_text_encoders_train_flags(args, text_encoders))
+                    ]
+                    if len(text_encoders) > 1:
+                        text_encoder = text_encoders
+                    else:
+                        text_encoder = text_encoders[0]
+                elif is_fsdp:
+                    # FSDP1: wrap frozen text encoders so they are sharded too.
+                    # Guard: skip encoders already on CPU (e.g. after output caching).
+                    text_encoders = [
+                        accelerator.prepare(t_enc) if t_enc.device.type != "cpu" else t_enc
+                        for t_enc in text_encoders
+                    ]
+                    if len(text_encoders) > 1:
+                        text_encoder = text_encoders
+                    else:
+                        text_encoder = text_encoders[0]
+                else:
+                    pass  # if text_encoder is not trained, no need to prepare. and device and dtype are already set
+
+                # When FSDP1 is active, the LoRA network must NOT be wrapped by FSDP.
+                if is_fsdp:
+                    network.to(accelerator.device)
+                    optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+                        optimizer, train_dataloader, val_dataloader, lr_scheduler
+                    )
+                else:
+                    network, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+                        network, optimizer, train_dataloader, val_dataloader, lr_scheduler
+                    )
+                training_model = network
 
         # Prepare phase DataLoaders individually
         phase_dataloaders = [accelerator.prepare(dl) for dl in _phase_dataloaders_raw]
@@ -1239,8 +1281,6 @@ class NetworkTrainer:
 
         if use_user_config:
             # save metadata of multiple datasets
-            # NOTE: pack "ss_datasets" value as json one time
-            #   or should also pack nested collections as json?
             datasets_metadata = []
             tag_frequency = {}  # merge tag frequency for metadata editor
             dataset_dirs_info = {}  # merge subset dirs for metadata editor
@@ -1318,9 +1358,6 @@ class NetworkTrainer:
 
                 # merge tag frequency:
                 for ds_dir_name, ds_freq_for_dir in dataset.tag_frequency.items():
-                    # あるディレクトリが複数のdatasetで使用されている場合、一度だけ数える
-                    # もともと繰り返し回数を指定しているので、キャプション内でのタグの出現回数と、それが学習で何度使われるかは一致しない
-                    # なので、ここで複数datasetの回数を合算してもあまり意味はない
                     if ds_dir_name in tag_frequency:
                         continue
                     tag_frequency[ds_dir_name] = ds_freq_for_dir
@@ -1487,7 +1524,6 @@ class NetworkTrainer:
                 os.remove(old_ckpt_file)
 
         # if text_encoder is not needed for training, delete it to save memory.
-        # TODO this can be automated after SDXL sample prompt cache is implemented
         if self.is_text_encoder_not_needed_for_training(args):
             logger.info("text_encoder is not needed for training. deleting to save memory.")
             for t_enc in text_encoders:
@@ -1951,7 +1987,6 @@ class NetworkTrainer:
 
             accelerator.wait_for_everyone()
 
-            # 指定エポックごとにモデルを保存
             optimizer_eval_fn()
             if args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs

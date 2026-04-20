@@ -92,7 +92,44 @@ class ColumnParallelLoRAModule(LoRAModule):
             scale = self.scale
 
         lx = self.lora_up(lx)
-        return org_forwarded + lx * self.multiplier * scale
+        output = org_forwarded + lx * self.multiplier * scale
+
+        # Only register hooks for the very first ColPar module to avoid output flood.
+        # Hooks fire in backward order: A (output) → B (lx) → C (lora_x).
+        # Reading the output tells exactly where in the chain NaN first appears:
+        #   A NaN only           → upstream (base model backward) is already NaN
+        #   A+B NaN, C finite    → should not happen (B = A * scale)
+        #   A+B+C NaN            → gather_from_sp_region backward (reduce_scatter) produces NaN
+        #   A finite, C NaN      → impossible (C is downstream of A in backward)
+        if self.training and not getattr(ColumnParallelLoRAModule, '_hooks_registered', False):
+            ColumnParallelLoRAModule._hooks_registered = True
+            name = self.lora_name
+
+            def _hook_output(grad, _n=name):
+                from tqdm import tqdm
+                status = "NaN" if not torch.isfinite(grad).all() else "ok"
+                tqdm.write(f"[NaN DIAG ColPar] A(output grad): {status}  {_n}  nan={torch.isnan(grad).sum().item()}  shape={tuple(grad.shape)}")
+                return grad
+            if output.requires_grad:
+                output.register_hook(_hook_output)
+
+            def _hook_lx(grad, _n=name):
+                from tqdm import tqdm
+                status = "NaN" if not torch.isfinite(grad).all() else "ok"
+                tqdm.write(f"[NaN DIAG ColPar] B(lx grad, after lora_up): {status}  nan={torch.isnan(grad).sum().item()}")
+                return grad
+            if lx.requires_grad:
+                lx.register_hook(_hook_lx)
+
+            def _hook_lora_x(grad, _n=name):
+                from tqdm import tqdm
+                status = "NaN" if not torch.isfinite(grad).all() else "ok"
+                tqdm.write(f"[NaN DIAG ColPar] C(lora_x grad, after gather bwd): {status}  nan={torch.isnan(grad).sum().item()}")
+                return grad
+            if lora_x.requires_grad:
+                lora_x.register_hook(_hook_lora_x)
+
+        return output
 
 
 class RowParallelLoRAModule(LoRAModule):
@@ -134,6 +171,7 @@ class RowParallelLoRAModule(LoRAModule):
             scale = self.scale
 
         lx = self.lora_up(lx)
+        lx_pre_scatter = lx  # save ref for hook before scatter changes the node
 
         # Match the reduction that org_forward applied
         if self._tp_group is not None:
@@ -145,7 +183,43 @@ class RowParallelLoRAModule(LoRAModule):
                 lx = lx.contiguous()
                 dist.all_reduce(lx, group=self._tp_group)
 
-        return org_forwarded + lx * self.multiplier * scale
+        output = org_forwarded + lx * self.multiplier * scale
+
+        # Only register hooks for the very first RowPar module.
+        # Hooks fire in backward order: A (output) → B (lx post-scatter) → C (lx pre-scatter).
+        # Reading the output:
+        #   A NaN only        → upstream (base model backward) is already NaN
+        #   A+B NaN, C finite → reduce_scatter backward (all_gather) introduces NaN
+        #   A+B+C NaN         → NaN from lora_up backward or upstream
+        if self.training and not getattr(RowParallelLoRAModule, '_hooks_registered', False):
+            RowParallelLoRAModule._hooks_registered = True
+            name = self.lora_name
+
+            def _hook_output(grad, _n=name):
+                from tqdm import tqdm
+                status = "NaN" if not torch.isfinite(grad).all() else "ok"
+                tqdm.write(f"[NaN DIAG RowPar] A(output grad): {status}  {_n}  nan={torch.isnan(grad).sum().item()}  shape={tuple(grad.shape)}")
+                return grad
+            if output.requires_grad:
+                output.register_hook(_hook_output)
+
+            def _hook_lx_post(grad, _n=name):
+                from tqdm import tqdm
+                status = "NaN" if not torch.isfinite(grad).all() else "ok"
+                tqdm.write(f"[NaN DIAG RowPar] B(lx post-scatter grad): {status}  nan={torch.isnan(grad).sum().item()}")
+                return grad
+            if lx.requires_grad:
+                lx.register_hook(_hook_lx_post)
+
+            def _hook_lx_pre(grad, _n=name):
+                from tqdm import tqdm
+                status = "NaN" if not torch.isfinite(grad).all() else "ok"
+                tqdm.write(f"[NaN DIAG RowPar] C(lx pre-scatter grad): {status}  nan={torch.isnan(grad).sum().item()}")
+                return grad
+            if lx_pre_scatter.requires_grad:
+                lx_pre_scatter.register_hook(_hook_lx_pre)
+
+        return output
 
 
 def _select_lora_class(child_module, tp_group=None, use_sp=False, seq_dim=1):
@@ -624,7 +698,7 @@ class LoRANetwork(torch.nn.Module):
         elif isinstance(text_encoder_lr, float) or isinstance(text_encoder_lr, int):
             text_encoder_lr = [float(text_encoder_lr)]
         elif len(text_encoder_lr) == 1:
-            pass  # already a list with one element
+            pass
 
         self.requires_grad_(True)
 
@@ -706,16 +780,22 @@ class LoRANetwork(torch.nn.Module):
             if isinstance(lora, ColumnParallelLoRAModule) and lora._tp_group is not None:
                 # lora_up.weight: (out_features/tp, lora_dim) → gather dim 0
                 w = lora.lora_up.weight.data
-                gathered = [torch.zeros_like(w) for _ in range(lora._tp_group.size())]
-                dist.all_gather(gathered, w.contiguous(), group=lora._tp_group)
-                lora.lora_up.weight.data = torch.cat(gathered, dim=0)
+                orig_device = w.device
+                # cuda_direct requires CUDA tensors; weights may be on CPU before
+                # the network moves to GPU (e.g. during verify checks).
+                w_c = w.contiguous().cuda()
+                gathered = [torch.zeros_like(w_c) for _ in range(lora._tp_group.size())]
+                dist.all_gather(gathered, w_c, group=lora._tp_group)
+                lora.lora_up.weight.data = torch.cat(gathered, dim=0).to(orig_device)
 
             elif isinstance(lora, RowParallelLoRAModule) and lora._tp_group is not None:
                 # lora_down.weight: (lora_dim, in_features/tp) → gather dim 1
                 w = lora.lora_down.weight.data
-                gathered = [torch.zeros_like(w) for _ in range(lora._tp_group.size())]
-                dist.all_gather(gathered, w.contiguous(), group=lora._tp_group)
-                lora.lora_down.weight.data = torch.cat(gathered, dim=1)
+                orig_device = w.device
+                w_c = w.contiguous().cuda()
+                gathered = [torch.zeros_like(w_c) for _ in range(lora._tp_group.size())]
+                dist.all_gather(gathered, w_c, group=lora._tp_group)
+                lora.lora_down.weight.data = torch.cat(gathered, dim=1).to(orig_device)
 
     def scatter_tp_lora_weights(self) -> None:
         """Re-shard LoRA weights back to per-rank slices after gather_tp_lora_weights().

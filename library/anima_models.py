@@ -1385,8 +1385,22 @@ class MiniTrainDIT(nn.Module):
         # _tp_sp_group is set externally by the TP trainer after sharding.
         # Not set in regular training → this block is completely skipped.
         _sp_group = getattr(self, '_tp_sp_group', None)
+        _sp_h_pad = 0  # tracks how many H rows we padded for TP divisibility
         if _sp_group is not None:
             from wd_parallel.collectives import _split_along_dim
+            tp_size = _sp_group.size()
+            H_orig = x_B_T_H_W_D.shape[2]
+            if H_orig % tp_size != 0:
+                # Pad H to the next multiple of tp_size so the scatter produces
+                # equal-sized chunks on all ranks.  Without padding, floor/ceil
+                # split makes allgather inputs different sizes, causing
+                # cudaErrorInvalidValue from out-of-bounds SHM reads.
+                _sp_h_pad = tp_size - (H_orig % tp_size)
+                x_B_T_H_W_D = torch.nn.functional.pad(
+                    x_B_T_H_W_D, (0, 0, 0, 0, 0, _sp_h_pad))
+                if block_kwargs["extra_per_block_pos_emb"] is not None:
+                    block_kwargs["extra_per_block_pos_emb"] = torch.nn.functional.pad(
+                        block_kwargs["extra_per_block_pos_emb"], (0, 0, 0, 0, 0, _sp_h_pad))
             x_B_T_H_W_D = _split_along_dim(x_B_T_H_W_D, _sp_group, seq_dim=2)
             if block_kwargs["extra_per_block_pos_emb"] is not None:
                 block_kwargs["extra_per_block_pos_emb"] = _split_along_dim(
@@ -1425,6 +1439,8 @@ class MiniTrainDIT(nn.Module):
         if _sp_group is not None:
             from wd_parallel.collectives import gather_from_sp_region
             x_B_T_H_W_D = gather_from_sp_region(x_B_T_H_W_D, _sp_group, seq_dim=2)
+            if _sp_h_pad > 0:
+                x_B_T_H_W_D = x_B_T_H_W_D[:, :, :H_orig, :, :]
 
         # Move to final layer device if needed (multi-GPU sharding only)
         if self._is_multi_gpu_sharded:

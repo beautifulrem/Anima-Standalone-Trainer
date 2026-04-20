@@ -82,20 +82,24 @@ def _make_anima_lora_tp_spec(sequence_parallel: bool = False, use_llm_adapter: b
         "blocks.*.mlp.layer2":             row(sp),
     }
     if use_llm_adapter:
+        # The LLM Adapter's T5 target sequence is REPLICATED on all TP ranks —
+        # it is never scattered by SP.  Using col(sp) / row(sp) here would make
+        # ColumnParallelLinear all-gather on seq_dim before the matmul, doubling
+        # the sequence (each rank provides its full copy → 2× tokens) and causing
+        # shape mismatches downstream.  Always use col(False) / row(False) so the
+        # adapter runs plain column-parallel (no sequence gather/scatter).
         entries.update({
-            # LLM Adapter self-attn: target sequence (B, T, D) — SP applies
-            "llm_adapter.blocks.*.self_attn.q_proj":  col(sp),
-            "llm_adapter.blocks.*.self_attn.k_proj":  col(sp),
-            "llm_adapter.blocks.*.self_attn.v_proj":  col(sp),
-            "llm_adapter.blocks.*.self_attn.o_proj":  row(sp),
-            # LLM Adapter cross-attn: q from target (SP-sharded), kv from Qwen3 context (replicated)
-            "llm_adapter.blocks.*.cross_attn.q_proj": col(sp),
+            "llm_adapter.blocks.*.self_attn.q_proj":  col(False),
+            "llm_adapter.blocks.*.self_attn.k_proj":  col(False),
+            "llm_adapter.blocks.*.self_attn.v_proj":  col(False),
+            "llm_adapter.blocks.*.self_attn.o_proj":  row(False),
+            "llm_adapter.blocks.*.cross_attn.q_proj": col(False),
             "llm_adapter.blocks.*.cross_attn.k_proj": col(False),
             "llm_adapter.blocks.*.cross_attn.v_proj": col(False),
-            "llm_adapter.blocks.*.cross_attn.o_proj": row(sp),
-            # LLM Adapter MLP: Sequential[0]=Linear(D→4D), [1]=GELU, [2]=Linear(4D→D)
-            "llm_adapter.blocks.*.mlp.0":             col(sp),
-            "llm_adapter.blocks.*.mlp.2":             row(sp),
+            "llm_adapter.blocks.*.cross_attn.o_proj": row(False),
+            # MLP: Sequential[0]=Linear(D→4D), [2]=Linear(4D→D)
+            "llm_adapter.blocks.*.mlp.0":             col(False),
+            "llm_adapter.blocks.*.mlp.2":             row(False),
         })
     return wdp.ParallelSpec(entries)
 
@@ -141,14 +145,17 @@ def _tag_tp_lora_params(network: torch.nn.Module) -> int:
     Returns the number of tagged parameters.
     """
     from networks.lora_anima import ColumnParallelLoRAModule, RowParallelLoRAModule
+    # post_process_network runs BEFORE apply_to(), so LoRA modules are not yet
+    # registered as PyTorch submodules. network.modules() only yields the
+    # LoRANetwork itself; the actual LoRA module objects live in network.unet_loras.
     tagged = 0
-    for module in network.modules():
-        if isinstance(module, ColumnParallelLoRAModule):
-            for p in module.lora_up.parameters():
+    for lora in network.unet_loras:
+        if isinstance(lora, ColumnParallelLoRAModule):
+            for p in lora.lora_up.parameters():
                 p._tp_sharded = True
                 tagged += 1
-        elif isinstance(module, RowParallelLoRAModule):
-            for p in module.lora_down.parameters():
+        elif isinstance(lora, RowParallelLoRAModule):
+            for p in lora.lora_down.parameters():
                 p._tp_sharded = True
                 tagged += 1
     return tagged
@@ -172,6 +179,8 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
         self.tp_groups = None
         self.tp_active = False
         self.use_sp = False
+        self._tp_step = 0
+        self._nan_grad_reported = False
 
     # ----- override: model loading + TP sharding -----
 
@@ -324,6 +333,113 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
 
         return unet
 
+    # ----- override: broadcast batch from rank 0 so all TP ranks see same data -----
+
+    @staticmethod
+    def _broadcast_tensor(t, tp_group, device):
+        """Broadcast a tensor from rank 0 to all TP ranks, handling shape mismatches."""
+        if t is None:
+            return None
+        t = t.to(device)
+        shape_t = torch.tensor(list(t.shape), dtype=torch.int64, device=device)
+        dist.broadcast(shape_t, src=0, group=tp_group)
+        canonical = torch.Size(shape_t.tolist())
+        if t.shape != canonical:
+            t = torch.zeros(canonical, dtype=t.dtype, device=device)
+        t = t.contiguous()
+        dist.broadcast(t, src=0, group=tp_group)
+        return t
+
+    def process_batch(self, batch, text_encoders, unet, network, vae, noise_scheduler,
+                      vae_dtype, weight_dtype, accelerator, args,
+                      text_encoding_strategy, tokenize_strategy,
+                      is_train=True, train_text_encoder=True, train_unet=True):
+        """Broadcast all per-sample batch tensors from rank 0 to all TP ranks.
+
+        TP requires all ranks to process the SAME batch. Without synchronization,
+        each rank independently samples from the DataLoader (same seed but diverged
+        Python RNG state) and loads different images from different resolution
+        buckets. This causes ColumnParallelLinear allgathers to receive
+        unequal-sized inputs (out-of-bounds SHM read / cudaErrorInvalidValue).
+        """
+        if self.tp_active and dist.is_initialized():
+            tp_group = self.tp_groups.tp
+            dev = accelerator.device
+
+            # Latents (main tensor — shape differs across resolution buckets)
+            if "latents" in batch and batch["latents"] is not None:
+                batch["latents"] = self._broadcast_tensor(batch["latents"], tp_group, dev)
+
+            # Per-sample loss weights
+            if "loss_weights" in batch and batch["loss_weights"] is not None:
+                batch["loss_weights"] = self._broadcast_tensor(batch["loss_weights"], tp_group, dev)
+
+            # Cached text encoder outputs
+            te_list = batch.get("text_encoder_outputs_list", None)
+            if te_list is not None:
+                batch["text_encoder_outputs_list"] = [
+                    self._broadcast_tensor(te, tp_group, dev) for te in te_list
+                ]
+
+            # Alpha masks (optional)
+            if "alpha_masks" in batch and batch["alpha_masks"] is not None:
+                batch["alpha_masks"] = self._broadcast_tensor(batch["alpha_masks"], tp_group, dev)
+
+        self._tp_step += 1
+        loss = super().process_batch(
+            batch, text_encoders, unet, network, vae, noise_scheduler,
+            vae_dtype, weight_dtype, accelerator, args,
+            text_encoding_strategy, tokenize_strategy,
+            is_train=is_train, train_text_encoder=train_text_encoder,
+            train_unet=train_unet,
+        )
+
+        # NaN/Inf detection: log the first occurrence to identify the root cause.
+        if self.tp_active and dist.get_rank() == 0:
+            loss_val = loss.item()
+            if not (loss_val == loss_val) or loss_val == float('inf') or loss_val == float('-inf'):  # isnan / isinf
+                lat = batch.get("latents", None)
+                lat_shape = tuple(lat.shape) if lat is not None else None
+                from tqdm import tqdm
+                tqdm.write(
+                    f"[TP NaN] step {self._tp_step}: forward loss={loss_val}  "
+                    f"latent_shape={lat_shape}"
+                )
+
+        return loss
+
+    # ----- override: per-step weight check -----
+
+    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True):
+        """Check LoRA weights for NaN/Inf before each training step.
+
+        Runs after optimizer.zero_grad() of the *previous* step (i.e. after the
+        previous optimizer.step()), so catches weights that were corrupted by
+        the optimizer update.  All ranks check their own weight slices because
+        TP-sharded params differ per rank.
+        """
+        if not self.tp_active or not is_train:
+            return
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        step = self._tp_step + 1  # _tp_step increments inside process_batch; this is the upcoming step
+
+        bad_weights = []
+        for name, p in network.named_parameters():
+            if not torch.isfinite(p.data).all():
+                bad_weights.append(
+                    f"{name}(shape={tuple(p.shape)}, "
+                    f"nan={torch.isnan(p.data).sum().item()}, "
+                    f"inf={torch.isinf(p.data).sum().item()})"
+                )
+        if bad_weights:
+            from tqdm import tqdm
+            tqdm.write(
+                f"[TP CHECK step {step} rank {rank}] NaN/Inf in LoRA WEIGHTS:\n"
+                + "\n".join(f"  {s}" for s in bad_weights[:10])
+                + ("\n  ... (truncated)" if len(bad_weights) > 10 else "")
+            )
+
     # ----- override: TP-aware LoRA gradient sync -----
 
     def all_reduce_network(self, accelerator, network):
@@ -339,7 +455,50 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             super().all_reduce_network(accelerator, network)
             return
 
+        # Gradient diagnostics on rank 0: log L2 norm every step + report first
+        # NaN/Inf occurrence.  Norm tracking reveals gradients growing toward NaN
+        # before the loss itself goes NaN.
+        if dist.get_rank() == 0:
+            total_sq = 0.0
+            max_abs  = 0.0
+            nan_params = []
+            for name, p in network.named_parameters():
+                if p.grad is None:
+                    continue
+                g = p.grad.detach()
+                if not torch.isfinite(g).all():
+                    nan_params.append(
+                        f"{name}(shape={tuple(g.shape)}, "
+                        f"nan={torch.isnan(g).sum().item()}, "
+                        f"inf={torch.isinf(g).sum().item()})"
+                    )
+                else:
+                    total_sq += g.norm(2).item() ** 2
+                    cur_max = g.abs().max().item()
+                    if cur_max > max_abs:
+                        max_abs = cur_max
+
+            from tqdm import tqdm
+            tqdm.write(
+                f"[TP GRAD step {self._tp_step}] "
+                f"norm={total_sq**0.5:.4f}  max={max_abs:.4f}"
+                + (f"  NaN/Inf in {len(nan_params)} param(s)" if nan_params else "")
+            )
+
+            if nan_params and not self._nan_grad_reported:
+                tqdm.write(
+                    f"[TP NaN] step {self._tp_step}: NaN/Inf gradients BEFORE sync:\n"
+                    + "\n".join(f"  {s}" for s in nan_params[:10])
+                    + ("\n  ... (truncated)" if len(nan_params) > 10 else "")
+                )
+                self._nan_grad_reported = True
+
         import wd_parallel as wdp
+        # On the first step, reset the NaN diagnostic counter in collectives so
+        # any events triggered by the verify check (before training) don't suppress
+        # the first real training NaN report.
+        if self._tp_step == 1:
+            wdp.reset_nan_diagnostics()
         # sync_replicated_grads skips _tp_sharded params automatically
         wdp.sync_replicated_grads(network, self.tp_groups.tp)
 
@@ -363,6 +522,13 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
         # Check LoRA tagging is correct
         from tp_sp_verify import run_all_checks as _tp_verify
         _tp_verify(dit=None, network=network, groups=self.tp_groups, use_sp=self.use_sp)
+
+        # Reset diagnostic hook flags — tp_sp_verify calls LoRA module forward()
+        # in training mode, which sets _hooks_registered=True on the class before
+        # actual training starts, silencing all hooks for the real training run.
+        from networks.lora_anima import ColumnParallelLoRAModule, RowParallelLoRAModule
+        ColumnParallelLoRAModule._hooks_registered = False
+        RowParallelLoRAModule._hooks_registered = False
 
         # Wrap save_weights to gather sharded LoRA weights from all TP ranks
         # before saving, then scatter them back so training can continue.
