@@ -945,6 +945,84 @@ function buildEnvVar(name, value) {
     return isWindows ? `$env:${name}='${value}';` : `export ${name}='${value}';`;
 }
 
+// Returns { gpuEnv, accelerateFlags, tpTrainCmd } or { error }
+function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
+    if (!gpuIds) return { gpuEnv: '', accelerateFlags: '', tpTrainCmd: null };
+
+    if (!/^[\d\s,]+$/.test(gpuIds))
+        return { error: `Invalid GPU IDs format: "${gpuIds}". Use numbers separated by commas (e.g. "0,1").` };
+
+    const validIds = gpuIds.split(',').map(s => s.trim()).filter(Boolean);
+    if (validIds.some(id => isNaN(parseInt(id))))
+        return { error: 'GPU IDs must be valid numbers.' };
+
+    const gpuEnv = buildEnvVar('CUDA_VISIBLE_DEVICES', validIds.join(','));
+    const ta = mergedConfig.training_arguments || {};
+    const mixedPrec = ta.mixed_precision || 'bf16';
+    const mode = ta.multigpu_mode || (ta.use_fsdp ? 'fsdp' : 'ddp');
+
+    let accelerateFlags = '';
+    let tpTrainCmd = null;
+
+    if (validIds.length > 1) {
+        if (mode === 'tp_sp') {
+            const tpScript = jobArch.scripts?.train_network_tp_sp;
+            if (!tpScript)
+                return { error: `TP/SP mode is not supported for the "${jobArch.id || 'current'}" architecture. No train_network_tp_sp script is defined.` };
+            const n = validIds.length;
+            const target = path.join(ROOT_DIR, tpScript);
+            tpTrainCmd = `python -m torch.distributed.run --nproc_per_node=${n} --master_addr 127.0.0.1 --master_port 29500 "${target}" --tp_degree ${n}${ta.sequence_parallel ? ' --sequence_parallel' : ''} --config_file="${mergedConfigPath}"`;
+
+        } else if (mode === 'fsdp2') {
+            const reshard = ta.fsdp2_reshard_after_forward ?? true;
+            accelerateFlags = `--use_fsdp --fsdp_version 2 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+            accelerateFlags += ` --fsdp_reshard_after_forward ${reshard ? 'true' : 'false'}`;
+            if (ta.fsdp2_cpu_ram_efficient_loading)  accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
+            if (ta.fsdp2_offload_params)             accelerateFlags += ` --fsdp_offload_params true`;
+            if (ta.fsdp2_activation_checkpointing)   accelerateFlags += ` --fsdp_activation_checkpointing true`;
+            if (ta.fsdp2_auto_wrap_policy && ta.fsdp2_auto_wrap_policy !== 'NO_WRAP') {
+                accelerateFlags += ` --fsdp_auto_wrap_policy ${ta.fsdp2_auto_wrap_policy}`;
+                if (ta.fsdp2_auto_wrap_policy === 'SIZE_BASED_WRAP' && ta.fsdp2_min_num_params)
+                    accelerateFlags += ` --fsdp_min_num_params ${ta.fsdp2_min_num_params}`;
+                if (ta.fsdp2_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
+                    const cls = (ta.fsdp2_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
+                    if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
+                }
+            }
+
+        } else if (mode === 'fsdp') {
+            accelerateFlags = `--use_fsdp --fsdp_version 1 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+            accelerateFlags += ` --fsdp_sharding_strategy ${ta.fsdp_sharding_strategy || 1}`;
+            // sync_module_states must accompany cpu_ram_efficient_loading
+            if (ta.fsdp_cpu_ram_efficient_loading)   accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
+            if (ta.fsdp_offload_params)              accelerateFlags += ` --fsdp_offload_params true`;
+            if (ta.fsdp_reshard_after_forward)       accelerateFlags += ` --fsdp_reshard_after_forward true`;
+            if (ta.fsdp_activation_checkpointing)    accelerateFlags += ` --fsdp_activation_checkpointing true`;
+            if (ta.fsdp_backward_prefetch)           accelerateFlags += ` --fsdp_backward_prefetch ${ta.fsdp_backward_prefetch}`;
+            if (ta.fsdp_forward_prefetch)            accelerateFlags += ` --fsdp_forward_prefetch true`;
+            if (ta.fsdp_use_orig_params === false)   accelerateFlags += ` --fsdp_use_orig_params false`;
+            if (ta.fsdp_min_num_params)              accelerateFlags += ` --fsdp_min_num_params ${ta.fsdp_min_num_params}`;
+            if (ta.fsdp_auto_wrap_policy) {
+                accelerateFlags += ` --fsdp_auto_wrap_policy ${ta.fsdp_auto_wrap_policy}`;
+                if (ta.fsdp_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
+                    const cls = (ta.fsdp_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
+                    if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
+                }
+            }
+
+        } else {
+            accelerateFlags = `--multi_gpu --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+        }
+    } else {
+        accelerateFlags = `--mixed_precision ${mixedPrec}`;
+    }
+
+    if (ta.torch_compile && mode !== 'tp_sp' && mode !== 'fsdp2')
+        accelerateFlags += ' --dynamo_backend inductor';
+
+    return { gpuEnv, accelerateFlags, tpTrainCmd };
+}
+
 function buildShellScript(activatePath, envVars, command) {
     if (isWindows) {
         return `& "${activatePath}";\n${envVars}\n${command}`;
@@ -1400,164 +1478,28 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         const venvPath = toNativePath(globalConfig.venv_path || path.join(ROOT_DIR, 'venv'));
         const venv = getVenvPaths(venvPath);
 
-        // Read config to check for GPU IDs
-        let gpuEnv = '';
-        let currentGpuIds = '';
-        let accelerateFlags = '';
-        let tpTrainCmd = null; // set when TP/SP mode is active
-
-        // Resolve architecture
         const jobArch = getArchForJob(mergedConfig);
         const hasNetwork = !!(mergedConfig.network_arguments && mergedConfig.network_arguments.network_module);
 
+        let currentGpuIds = '';
         try {
             const rawConfig = TOML.parse(fs.readFileSync(configPath, 'utf8'));
             currentGpuIds = rawConfig.gpu_ids ? rawConfig.gpu_ids.toString().trim() : '';
-            const gpuIds = currentGpuIds;
-
-            if (gpuIds) {
-                // Validate format: "0", "0,1", "0, 1", etc.
-                if (!/^[\d\s,]+$/.test(gpuIds)) {
-                    return res.status(400).json({ error: `Invalid GPU IDs format: "${gpuIds}". Use numbers separated by commas (e.g. "0,1").` });
-                }
-
-                // Clean up and re-format
-                const validIds = gpuIds.split(',')
-                    .map(s => s.trim())
-                    .filter(s => s.length > 0);
-
-                // Ensure they are numbers
-                if (validIds.some(id => isNaN(parseInt(id)))) {
-                    return res.status(400).json({ error: "GPU IDs must be valid numbers." });
-                }
-
-                // Reconstruct safe string
-                const safeGpuString = validIds.join(',');
-
-                // Set explicit GPUs
-                gpuEnv = buildEnvVar('CUDA_VISIBLE_DEVICES', safeGpuString);
-
-                const mixedPrec = mergedConfig.training_arguments?.mixed_precision || 'bf16';
-
-                if (validIds.length > 1) {
-                    // Resolve mode: explicit multigpu_mode takes priority, fallback to use_fsdp for compat
-                    const multiGpuMode = mergedConfig.training_arguments?.multigpu_mode
-                        || (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp');
-
-                    if (multiGpuMode === 'tp_sp') {
-                        // TP/SP: torchrun instead of accelerate launch, dedicated script.
-                        const tpScript = jobArch.scripts?.train_network_tp_sp;
-                        if (!tpScript) {
-                            return res.status(400).json({
-                                error: `TP/SP mode is not supported for the "${jobArch.id || 'current'}" architecture. No train_network_tp_sp script is defined.`
-                            });
-                        }
-                        const tpDegree = validIds.length;
-                        const useSeqParallel = mergedConfig.training_arguments?.sequence_parallel ?? false;
-                        const tpTargetScript = path.join(ROOT_DIR, tpScript);
-                        tpTrainCmd = `python -m torch.distributed.run --nproc_per_node=${tpDegree} --master_addr 127.0.0.1 --master_port 29500 "${tpTargetScript}" --tp_degree ${tpDegree}${useSeqParallel ? ' --sequence_parallel' : ''} --config_file="${mergedConfigPath}"`;
-                    } else if (multiGpuMode === 'fsdp2') {
-                        // FSDP2 — PyTorch fully_shard API (accelerate >= 0.34, PyTorch >= 2.4)
-                        const t2 = mergedConfig.training_arguments;
-                        accelerateFlags = `--use_fsdp --fsdp_version 2 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
-                        // reshard_after_forward is a bool in FSDP2
-                        const reshard2 = t2.fsdp2_reshard_after_forward ?? true;
-                        accelerateFlags += ` --fsdp_reshard_after_forward ${reshard2 ? 'true' : 'false'}`;
-                        if (t2.fsdp2_cpu_ram_efficient_loading) {
-                            accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
-                        }
-                        if (t2.fsdp2_offload_params) {
-                            accelerateFlags += ` --fsdp_offload_params true`;
-                        }
-                        if (t2.fsdp2_activation_checkpointing) {
-                            accelerateFlags += ` --fsdp_activation_checkpointing true`;
-                        }
-                        if (t2.fsdp2_auto_wrap_policy && t2.fsdp2_auto_wrap_policy !== 'NO_WRAP') {
-                            accelerateFlags += ` --fsdp_auto_wrap_policy ${t2.fsdp2_auto_wrap_policy}`;
-                        }
-                        if (t2.fsdp2_auto_wrap_policy === 'SIZE_BASED_WRAP' && t2.fsdp2_min_num_params) {
-                            accelerateFlags += ` --fsdp_min_num_params ${t2.fsdp2_min_num_params}`;
-                        }
-                        if (t2.fsdp2_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
-                            const userCls = (t2.fsdp2_transformer_layer_cls_to_wrap || '').trim();
-                            const archCls = getArchForJob(mergedConfig).fsdp_transformer_cls || '';
-                            const clsToWrap = userCls || archCls;
-                            if (clsToWrap) {
-                                accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${clsToWrap}"`;
-                            }
-                        }
-                    } else if (multiGpuMode === 'fsdp' || mergedConfig.training_arguments?.use_fsdp) {
-                        // FSDP1 — classic FullyShardedDataParallel API
-                        accelerateFlags = `--use_fsdp --fsdp_version 1 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
-                        accelerateFlags += ` --fsdp_sharding_strategy ${mergedConfig.training_arguments.fsdp_sharding_strategy || 1}`;
-                        // cpu_ram_efficient_loading: only rank 0 loads from disk, others receive via broadcast.
-                        // accelerate requires sync_module_states=true alongside it — emit both together.
-                        if (mergedConfig.training_arguments.fsdp_cpu_ram_efficient_loading) {
-                            accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
-                        }
-                        if (mergedConfig.training_arguments.fsdp_offload_params) {
-                            accelerateFlags += ` --fsdp_offload_params true`;
-                        }
-                        if (mergedConfig.training_arguments.fsdp_reshard_after_forward) {
-                            accelerateFlags += ` --fsdp_reshard_after_forward true`;
-                        }
-                        if (mergedConfig.training_arguments.fsdp_activation_checkpointing) {
-                            accelerateFlags += ` --fsdp_activation_checkpointing true`;
-                        }
-                        if (mergedConfig.training_arguments.fsdp_backward_prefetch) {
-                            accelerateFlags += ` --fsdp_backward_prefetch ${mergedConfig.training_arguments.fsdp_backward_prefetch}`;
-                        }
-                        if (mergedConfig.training_arguments.fsdp_forward_prefetch) {
-                            accelerateFlags += ` --fsdp_forward_prefetch true`;
-                        }
-                        // use_orig_params defaults true - only emit false explicitly to override accelerate's default
-                        if (mergedConfig.training_arguments.fsdp_use_orig_params === false) {
-                            accelerateFlags += ` --fsdp_use_orig_params false`;
-                        }
-                        if (mergedConfig.training_arguments.fsdp_min_num_params) {
-                            accelerateFlags += ` --fsdp_min_num_params ${mergedConfig.training_arguments.fsdp_min_num_params}`;
-                        }
-                        if (mergedConfig.training_arguments.fsdp_auto_wrap_policy) {
-                            accelerateFlags += ` --fsdp_auto_wrap_policy ${mergedConfig.training_arguments.fsdp_auto_wrap_policy}`;
-                        }
-                        if (mergedConfig.training_arguments.fsdp_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
-                            const userCls = (mergedConfig.training_arguments.fsdp_transformer_layer_cls_to_wrap || '').trim();
-                            const archCls = getArchForJob(mergedConfig).fsdp_transformer_cls || '';
-                            const clsToWrap = userCls || archCls;
-                            if (clsToWrap) {
-                                accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${clsToWrap}"`;
-                            }
-                        }
-                    } else {
-                        // Standard DDP
-                        accelerateFlags = `--multi_gpu --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
-                    }
-                } else {
-                    // Single GPU: always forward --mixed_precision to accelerate
-                    accelerateFlags = `--mixed_precision ${mixedPrec}`;
-                }
-            }
         } catch (err) {
             console.warn("Failed to parse config for GPU options:", err);
-            if (err.message && err.message.startsWith('Invalid GPU')) {
-                return res.status(400).json({ error: err.message });
-            }
         }
 
-        // torch.compile support (not compatible with TP/SP or FSDP2 — skip for those modes)
+        const launch = buildLaunchConfig(currentGpuIds, mergedConfig, mergedConfigPath, jobArch);
+        if (launch.error) return res.status(400).json({ error: launch.error });
+        const { gpuEnv, accelerateFlags, tpTrainCmd } = launch;
+
         const resolvedMode = mergedConfig.training_arguments?.multigpu_mode
             || (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp');
-        if (mergedConfig.training_arguments?.torch_compile && resolvedMode !== 'tp_sp' && resolvedMode !== 'fsdp2') {
-            accelerateFlags += ' --dynamo_backend inductor';
-        }
 
-        // Build the launch command
         let trainCmd;
         if (resolvedMode === 'tp_sp' && tpTrainCmd) {
-            // TP/SP: use the torchrun command built in the GPU block above
             trainCmd = tpTrainCmd;
         } else {
-            // DDP / FSDP: standard accelerate launch
             const scriptName = hasNetwork ? jobArch.scripts.train_network : jobArch.scripts.train;
             const targetScript = path.join(ROOT_DIR, scriptName);
             trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${targetScript}" --config_file="${mergedConfigPath}"`;
