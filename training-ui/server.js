@@ -1033,6 +1033,15 @@ function buildShellScript(activatePath, envVars, command) {
     }
 }
 
+// buildGenerationLaunchCommand for single gpu, faster loading
+function buildGenerationLaunchCommand(genScript, args, genGpuCount, genAccelerateFlags) {
+    if (genGpuCount > 1) {
+        return `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${genAccelerateFlags} "${genScript}" ${args.join(' ')}`;
+    }
+
+    return `python "${genScript}" ${args.join(' ')}`;
+}
+
 function spawnShell(script, cwd) {
     if (isWindows) {
         return spawn('powershell', ['-NoProfile', '-Command', script], {
@@ -1277,7 +1286,7 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
                     buildEnvVar('LOG_LEVEL', 'DEBUG'),
                     gpuEnv
                 ].filter(Boolean).join('\n');
-                const launchCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${genAccelerateFlags} "${genScript}" ${args.join(' ')}`;
+                const launchCmd = buildGenerationLaunchCommand(genScript, args, genGpuCount, genAccelerateFlags);
                 const script = buildShellScript(venv.activate, envVars, launchCmd);
 
                 console.log("Starting persistent generation server...");
@@ -1358,7 +1367,7 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
                 buildEnvVar('PYTHONIOENCODING', 'utf-8'),
                 gpuEnv
             ].filter(Boolean).join('\n');
-            const oneShotCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${genAccelerateFlags} "${genScript}" ${args.join(' ')}`;
+            const oneShotCmd = buildGenerationLaunchCommand(genScript, args, genGpuCount, genAccelerateFlags);
             const oneShotScript = buildShellScript(venv.activate, oneShotEnvVars, oneShotCmd);
 
             const oneShotProc = spawnShell(oneShotScript, ROOT_DIR);
