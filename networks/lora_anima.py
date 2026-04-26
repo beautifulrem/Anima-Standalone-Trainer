@@ -191,22 +191,29 @@ class PackedColumnParallelLoRAModule(LoRAModule):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
-        outs = []
-        for down, up in zip(self.lora_down, self.lora_up):
-            lx = down(shared_x)
-            if self.dropout is not None and self.training:
-                lx = torch.nn.functional.dropout(lx, p=self.dropout)
-            if self.rank_dropout is not None and self.training:
-                mask = torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout
-                if len(lx.size()) == 3:
-                    mask = mask.unsqueeze(1)
-                lx = lx * mask
-                scale = self.scale * (1.0 / (1.0 - self.rank_dropout))
-            else:
-                scale = self.scale
-            outs.append(up(lx) * scale)
+        # Execute packed LoRA as a single down projection plus a single batched
+        # up projection while preserving the existing per-part parameter layout.
+        down_weight = torch.cat([down.weight for down in self.lora_down], dim=0)
+        lx = torch.nn.functional.linear(shared_x, down_weight)
+        lx = lx.view(*shared_x.shape[:-1], self._packed_parts, self.lora_dim)
 
-        return org_forwarded + torch.cat(outs, dim=-1) * self.multiplier
+        if self.dropout is not None and self.training:
+            lx = torch.nn.functional.dropout(lx, p=self.dropout)
+
+        if self.rank_dropout is not None and self.training:
+            mask = torch.rand((lx.size(0), self._packed_parts, self.lora_dim), device=lx.device) > self.rank_dropout
+            if lx.dim() == 4:
+                mask = mask.unsqueeze(1)
+            lx = lx * mask
+            scale = self.scale * (1.0 / (1.0 - self.rank_dropout))
+        else:
+            scale = self.scale
+
+        up_weight = torch.stack([up.weight for up in self.lora_up], dim=0)
+        outs = torch.einsum("...pr,por->...po", lx, up_weight)
+        outs = outs.reshape(*shared_x.shape[:-1], -1)
+
+        return org_forwarded + outs * (self.multiplier * scale)
 
 
 class RowParallelLoRAModule(LoRAModule):
