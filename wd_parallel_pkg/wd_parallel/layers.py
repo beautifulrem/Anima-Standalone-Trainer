@@ -467,8 +467,9 @@ class ColumnParallelLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         adapter = getattr(self, "_tp_lora_adapter", None)
         if adapter is not None:
-            # LoRA path: two-step gather + lora-augmented matmul (unchanged)
-            return adapter.forward_from_prepared_input(self._prepare_tp_input(x))
+            # The adapter owns TP/SP-specific communication so it can choose
+            # fused async LoRA kernels without reimplementing layer dispatch here.
+            return adapter(x)
         if self.sequence_parallel and self._group is not None and self._group.size() > 1:
             # SP path: fused async Function (backward overlaps AG/RS with matmul)
             return _ColumnLinearFwdBwd.apply(x, self.weight, self.bias, self._group, self.seq_dim)

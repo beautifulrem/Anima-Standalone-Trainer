@@ -45,6 +45,143 @@ def _is_tp_linear(module: torch.nn.Module) -> bool:
     return name in ("ColumnParallelLinear", "RowParallelLinear")
 
 
+class _ColumnLoRAFwdBwd(torch.autograd.Function):
+    """Simple fused async TP+SP column LoRA path.
+
+    This intentionally only handles the clean case:
+      - plain ColumnParallelLoRAModule
+      - sequence_parallel=True
+      - no module / neuron / rank dropout
+
+    Other LoRA cases keep using the existing implementation.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        input_,
+        base_weight,
+        bias,
+        lora_down_weight,
+        lora_up_weight,
+        lora_scale,
+        group,
+        seq_dim,
+    ):
+        from wd_parallel.collectives import _gather_along_dim
+
+        ctx.group = group
+        ctx.seq_dim = seq_dim
+        ctx.use_bias = bias is not None
+        ctx.base_weight_requires_grad = base_weight.requires_grad
+        ctx.lora_down_requires_grad = lora_down_weight.requires_grad
+        ctx.lora_up_requires_grad = lora_up_weight.requires_grad
+        ctx.lora_scale = float(lora_scale)
+
+        gathered = (
+            _gather_along_dim(input_, group, seq_dim, buf_name="col_lora_fwd_gather")
+            if group is not None and group.size() > 1
+            else input_
+        )
+        lora_mid = torch.nn.functional.linear(gathered, lora_down_weight, None)
+        output = torch.nn.functional.linear(gathered, base_weight, bias)
+        output = output + torch.nn.functional.linear(lora_mid, lora_up_weight, None) * ctx.lora_scale
+
+        ctx.save_for_backward(input_, base_weight, lora_down_weight, lora_up_weight, lora_mid)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        from wd_parallel.collectives import _async_all_gather_seq_dim, _async_reduce_scatter_seq_dim
+
+        input_, base_weight, lora_down_weight, lora_up_weight, lora_mid = ctx.saved_tensors
+        group = ctx.group
+        seq_dim = ctx.seq_dim
+        do_async = group is not None and group.size() > 1
+
+        need_grad_input = ctx.needs_input_grad[0]
+        need_grad_base_weight = ctx.needs_input_grad[1] and ctx.base_weight_requires_grad
+        need_grad_bias = ctx.needs_input_grad[2] and ctx.use_bias
+        need_grad_lora_down = ctx.needs_input_grad[3] and ctx.lora_down_requires_grad
+        need_grad_lora_up = ctx.needs_input_grad[4] and ctx.lora_up_requires_grad
+        need_full_input = need_grad_base_weight or need_grad_lora_down
+
+        if grad_output.dtype != base_weight.dtype:
+            grad_output = grad_output.to(base_weight.dtype)
+
+        if do_async and need_full_input:
+            ag_buf, ag_handle, ag_transpose = _async_all_gather_seq_dim(input_, group, seq_dim)
+        else:
+            ag_buf = ag_handle = ag_transpose = None
+
+        grad_lora_mid = grad_output.matmul(lora_up_weight) * ctx.lora_scale
+
+        if need_grad_input:
+            grad_input_full = grad_output.matmul(base_weight) + grad_lora_mid.matmul(lora_down_weight)
+        else:
+            grad_input_full = None
+
+        if do_async and need_grad_input:
+            rs_buf, rs_handle, rs_transpose = _async_reduce_scatter_seq_dim(grad_input_full, group, seq_dim)
+        else:
+            rs_buf = rs_handle = rs_transpose = None
+
+        if need_grad_lora_up:
+            grad_weight_lora_up = (
+                (grad_output * ctx.lora_scale).reshape(-1, grad_output.shape[-1]).t().matmul(
+                    lora_mid.reshape(-1, lora_mid.shape[-1])
+                )
+            )
+        else:
+            grad_weight_lora_up = None
+
+        if ag_handle is not None:
+            ag_handle.wait()
+            gathered = ag_buf.transpose(0, seq_dim).contiguous() if ag_transpose else ag_buf
+        elif need_full_input:
+            gathered = input_
+        else:
+            gathered = None
+
+        if gathered is not None and gathered.dtype != base_weight.dtype:
+            gathered = gathered.to(base_weight.dtype)
+
+        if need_grad_base_weight:
+            grad_weight_base = grad_output.reshape(-1, grad_output.shape[-1]).t().matmul(
+                gathered.reshape(-1, gathered.shape[-1])
+            )
+        else:
+            grad_weight_base = None
+
+        if need_grad_lora_down:
+            grad_weight_lora_down = grad_lora_mid.reshape(-1, grad_lora_mid.shape[-1]).t().matmul(
+                gathered.reshape(-1, gathered.shape[-1])
+            )
+        else:
+            grad_weight_lora_down = None
+
+        if rs_handle is not None:
+            rs_handle.wait()
+            grad_input = rs_buf.transpose(0, seq_dim).contiguous() if rs_transpose else rs_buf
+        else:
+            grad_input = grad_input_full
+
+        grad_bias = (
+            grad_output.sum(list(range(grad_output.ndim - 1))) if need_grad_bias else None
+        )
+
+        return (
+            grad_input,
+            grad_weight_base,
+            grad_bias,
+            grad_weight_lora_down,
+            grad_weight_lora_up,
+            None,
+            None,
+            None,
+        )
+
+
 class ColumnParallelLoRAModule(LoRAModule):
     """LoRA adapter for ColumnParallelLinear.
 
@@ -138,6 +275,29 @@ class ColumnParallelLoRAModule(LoRAModule):
         return output
 
     def forward(self, x):
+        # Future AI-agent follow-up:
+        # extend this async TP+SP LoRA path to cover packed column LoRA and
+        # dropout-enabled cases, but keep the design as small and local as
+        # possible instead of reworking wd_parallel.
+        if (
+            self._tp_group is not None
+            and self._tp_group.size() > 1
+            and self._use_sp
+            and self.dropout is None
+            and self.rank_dropout is None
+            and self.module_dropout is None
+        ):
+            org_module = self.org_module_ref[0]
+            return _ColumnLoRAFwdBwd.apply(
+                x,
+                org_module.weight,
+                org_module.bias,
+                self.lora_down.weight,
+                self.lora_up.weight,
+                float(self.multiplier) * float(self.scale),
+                self._tp_group,
+                self._seq_dim,
+            )
         shared_x = self._prepare_tp_input(x)
         return self.forward_from_prepared_input(shared_x)
 

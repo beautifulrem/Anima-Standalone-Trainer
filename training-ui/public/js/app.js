@@ -419,8 +419,9 @@ function populateConfig(config) {
   $("cfg-ddp-gradient-as-bucket-view").checked =
     t.ddp_gradient_as_bucket_view ?? false;
   $("cfg-ddp-static-graph").checked = t.ddp_static_graph ?? false;
-  // Multi-GPU mode selector (ddp/fsdp/fsdp2/tp_sp) — backward compat: infer from use_fsdp
-  const restoredMode = t.multigpu_mode || (t.use_fsdp ? "fsdp" : "ddp");
+  // Multi-GPU mode selector (ddp/fsdp/fsdp2/deepspeed/tp_sp) — backward compat: infer from use_fsdp
+  const restoredMode =
+    t.multigpu_mode || (t.deepspeed ? "deepspeed" : t.use_fsdp ? "fsdp" : "ddp");
   $("cfg-multigpu-mode").value = restoredMode;
   applyMultiGpuMode(restoredMode);
   // TP/SP options
@@ -469,6 +470,21 @@ function populateConfig(config) {
     "hidden",
     $("cfg-fsdp2-auto-wrap-policy").value !== "SIZE_BASED_WRAP",
   );
+  // DeepSpeed restore
+  $("cfg-ds-zero-stage").value = String(t.zero_stage ?? 2);
+  $("cfg-ds-offload-optimizer-device").value =
+    t.offload_optimizer_device || "none";
+  $("cfg-ds-offload-optimizer-nvme-path").value =
+    t.offload_optimizer_nvme_path || "";
+  $("cfg-ds-offload-param-device").value = t.offload_param_device || "none";
+  $("cfg-ds-offload-param-nvme-path").value =
+    t.offload_param_nvme_path || "";
+  $("cfg-ds-zero3-init-flag").checked = t.zero3_init_flag ?? false;
+  $("cfg-ds-zero3-save-16bit-model").checked =
+    t.zero3_save_16bit_model ?? false;
+  $("cfg-ds-fp16-master-weights-and-gradients").checked =
+    t.fp16_master_weights_and_gradients ?? false;
+  updateDeepspeedOffloadUI();
   $("cfg-step-profile").checked = t.step_profile ?? false;
   $("cfg-profile-microbatch").checked = t.profile_microbatch ?? false;
   $("cfg-profile-microbatch-group").style.display = (t.step_profile ?? false) ? "" : "none";
@@ -608,6 +624,9 @@ function gatherConfig() {
   ).value;
   const isEpochs = unit === "epochs";
   const enableSampling = $("cfg-enable-sampling").checked;
+  const isMultiGpu =
+    document.querySelectorAll('input[name="gpu-select"]:checked').length > 1;
+  const multiGpuMode = $("cfg-multigpu-mode").value;
   const optimizerArgs = [];
   const wdValue = $("cfg-weight-decay").value;
   if (wdValue !== "") {
@@ -681,12 +700,8 @@ function gatherConfig() {
       ...($("cfg-disable-bucket-shuffle").checked && {
         disable_bucket_shuffle: true,
       }),
-      multigpu_mode:
-        document.querySelectorAll('input[name="gpu-select"]:checked').length > 1
-          ? $("cfg-multigpu-mode").value
-          : "ddp",
-      ...($("cfg-multigpu-mode").value === "tp_sp" &&
-        document.querySelectorAll('input[name="gpu-select"]:checked').length > 1
+      multigpu_mode: isMultiGpu ? multiGpuMode : "ddp",
+      ...(multiGpuMode === "tp_sp" && isMultiGpu
           ? {
               tp_degree: safeInt($("cfg-tp-degree").value) || 2,
               tp_backend: $("cfg-tp-backend")?.value || "auto",
@@ -694,23 +709,43 @@ function gatherConfig() {
               ...($("cfg-no-fuse-qkv")?.checked ? { no_fuse_qkv: true } : {}),
             }
           : {}),
-      use_cuda_direct:
-        document.querySelectorAll('input[name="gpu-select"]:checked').length > 1
-          ? $("cfg-use-cuda-direct").checked
-          : false,
-      ddp_gradient_as_bucket_view:
-        document.querySelectorAll('input[name="gpu-select"]:checked').length > 1
-          ? $("cfg-ddp-gradient-as-bucket-view").checked
-          : false,
-      ddp_static_graph:
-        document.querySelectorAll('input[name="gpu-select"]:checked').length > 1
-          ? $("cfg-ddp-static-graph").checked
-          : false,
+      ...(multiGpuMode === "deepspeed" && isMultiGpu
+        ? {
+            deepspeed: true,
+            zero_stage: safeInt($("cfg-ds-zero-stage").value, 2),
+            offload_optimizer_device:
+              $("cfg-ds-offload-optimizer-device").value !== "none"
+                ? $("cfg-ds-offload-optimizer-device").value
+                : undefined,
+            offload_optimizer_nvme_path:
+              $("cfg-ds-offload-optimizer-device").value === "nvme"
+                ? $("cfg-ds-offload-optimizer-nvme-path").value.trim() ||
+                  undefined
+                : undefined,
+            offload_param_device:
+              $("cfg-ds-offload-param-device").value !== "none"
+                ? $("cfg-ds-offload-param-device").value
+                : undefined,
+            offload_param_nvme_path:
+              $("cfg-ds-offload-param-device").value === "nvme"
+                ? $("cfg-ds-offload-param-nvme-path").value.trim() || undefined
+                : undefined,
+            zero3_init_flag: $("cfg-ds-zero3-init-flag").checked,
+            zero3_save_16bit_model: $("cfg-ds-zero3-save-16bit-model").checked,
+            fp16_master_weights_and_gradients: $(
+              "cfg-ds-fp16-master-weights-and-gradients",
+            ).checked,
+          }
+        : { deepspeed: false }),
+      use_cuda_direct: isMultiGpu ? $("cfg-use-cuda-direct").checked : false,
+      ddp_gradient_as_bucket_view: isMultiGpu
+        ? $("cfg-ddp-gradient-as-bucket-view").checked
+        : false,
+      ddp_static_graph: isMultiGpu ? $("cfg-ddp-static-graph").checked : false,
       // FSDP Configs
-      use_fsdp:
-        document.querySelectorAll('input[name="gpu-select"]:checked').length > 1
-          ? ($("cfg-multigpu-mode").value === "fsdp" || $("cfg-multigpu-mode").value === "fsdp2")
-          : false,
+      use_fsdp: isMultiGpu
+        ? multiGpuMode === "fsdp" || multiGpuMode === "fsdp2"
+        : false,
       fsdp_sharding_strategy: $("cfg-fsdp-sharding-strategy").value,
       fsdp_offload_params: $("cfg-fsdp-offload-params").checked,
       fsdp_reshard_after_forward: $("cfg-fsdp-reshard-after-forward").checked,
@@ -2626,12 +2661,14 @@ function applyMultiGpuMode(mode) {
   const ddpGroup   = $("group-ddp-opts");
   const fsdpGroup  = $("group-fsdp");
   const fsdp2Group = $("group-fsdp2");
+  const dsGroup    = $("group-deepspeed");
   const tpGroup    = $("group-tp-sp");
   if (!ddpGroup || !fsdpGroup || !tpGroup) return;
 
   ddpGroup.classList.toggle("hidden",   mode !== "ddp");
   fsdpGroup.classList.toggle("hidden",  mode !== "fsdp");
   if (fsdp2Group) fsdp2Group.classList.toggle("hidden", mode !== "fsdp2");
+  if (dsGroup) dsGroup.classList.toggle("hidden", mode !== "deepspeed");
   tpGroup.classList.toggle("hidden",    mode !== "tp_sp");
 
   // Keep hidden checkbox in sync so reconcileFSDPConflicts still works
@@ -2639,6 +2676,7 @@ function applyMultiGpuMode(mode) {
   if (fsdpToggle) fsdpToggle.checked = (mode === "fsdp" || mode === "fsdp2");
 
   updateCudaDirectForTpSp();
+  updateDeepspeedOffloadUI();
 }
 
 function updateCudaDirectForTpSp() {
@@ -2647,11 +2685,22 @@ function updateCudaDirectForTpSp() {
   if (!cudaGroup || !cudaToggle) return;
 
   const mode   = $("cfg-multigpu-mode")?.value;
-  const isTpSp = mode === "tp_sp";
+  const lockCudaDirect = mode === "tp_sp" || mode === "deepspeed";
 
-  cudaGroup.classList.toggle("disabled-section", isTpSp);
-  cudaToggle.disabled = isTpSp;
-  if (isTpSp) cudaToggle.checked = false;
+  cudaGroup.classList.toggle("disabled-section", lockCudaDirect);
+  cudaToggle.disabled = lockCudaDirect;
+  if (lockCudaDirect) cudaToggle.checked = false;
+}
+
+function updateDeepspeedOffloadUI() {
+  const optDevice = $("cfg-ds-offload-optimizer-device");
+  const paramDevice = $("cfg-ds-offload-param-device");
+  const optNvmeGroup = $("ds-offload-opt-nvme-group");
+  const paramNvmeGroup = $("ds-offload-param-nvme-group");
+  if (!optDevice || !paramDevice || !optNvmeGroup || !paramNvmeGroup) return;
+
+  optNvmeGroup.classList.toggle("hidden", optDevice.value !== "nvme");
+  paramNvmeGroup.classList.toggle("hidden", paramDevice.value !== "nvme");
 }
 
 function updateMultiGPUUI() {
@@ -2679,7 +2728,7 @@ function updateMultiGPUUI() {
     if (modeGroup) modeGroup.classList.add("disabled-section");
     cudaGroup.classList.add("disabled-section");
     cudaToggle.checked = false;
-    ["group-ddp-opts", "group-fsdp", "group-fsdp2", "group-tp-sp"].forEach(id => {
+    ["group-ddp-opts", "group-fsdp", "group-fsdp2", "group-deepspeed", "group-tp-sp"].forEach(id => {
       const el = $(id);
       if (el) el.classList.add("hidden");
     });
@@ -2784,6 +2833,10 @@ document.addEventListener("DOMContentLoaded", () => {
       reconcileFSDPConflicts();
     });
   }
+  const dsOptDevice = $("cfg-ds-offload-optimizer-device");
+  const dsParamDevice = $("cfg-ds-offload-param-device");
+  if (dsOptDevice) dsOptDevice.addEventListener("change", updateDeepspeedOffloadUI);
+  if (dsParamDevice) dsParamDevice.addEventListener("change", updateDeepspeedOffloadUI);
   // fsdpToggle is a hidden input
   if (cudaDirectToggle) {
     cudaDirectToggle.addEventListener("change", reconcileFSDPConflicts);
@@ -2830,6 +2883,7 @@ document.addEventListener("DOMContentLoaded", () => {
     strategySelect.addEventListener("change", window.updateFSDPInfoBox);
     window.updateFSDPInfoBox(); // Initial call
   }
+  updateDeepspeedOffloadUI();
   // Initial reconcile call
   reconcileFSDPConflicts();
 });

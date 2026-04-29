@@ -952,7 +952,7 @@ function buildEnvVar(name, value) {
 function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
     const ta = mergedConfig.training_arguments || {};
     const mixedPrec = ta.mixed_precision || 'bf16';
-    const mode = ta.multigpu_mode || (ta.use_fsdp ? 'fsdp' : 'ddp');
+    const mode = ta.multigpu_mode || (ta.deepspeed ? 'deepspeed' : (ta.use_fsdp ? 'fsdp' : 'ddp'));
 
     let gpuEnv = '';
     let accelerateFlags = '';
@@ -1021,6 +1021,29 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
                         const cls = (ta.fsdp_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
                         if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
                     }
+                }
+
+            } else if (mode === 'deepspeed') {
+                accelerateFlags = `--use_deepspeed --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+                const zeroStage = Number.isFinite(Number(ta.zero_stage)) ? Number(ta.zero_stage) : 2;
+                accelerateFlags += ` --zero_stage ${zeroStage}`;
+                if (ta.offload_optimizer_device) {
+                    accelerateFlags += ` --offload_optimizer_device ${ta.offload_optimizer_device}`;
+                }
+                if (ta.offload_optimizer_device === 'nvme' && ta.offload_optimizer_nvme_path) {
+                    accelerateFlags += ` --offload_optimizer_nvme_path "${ta.offload_optimizer_nvme_path}"`;
+                }
+                if (ta.offload_param_device) {
+                    accelerateFlags += ` --offload_param_device ${ta.offload_param_device}`;
+                }
+                if (ta.offload_param_device === 'nvme' && ta.offload_param_nvme_path) {
+                    accelerateFlags += ` --offload_param_nvme_path "${ta.offload_param_nvme_path}"`;
+                }
+                if (ta.zero3_init_flag) {
+                    accelerateFlags += ' --zero3_init_flag true';
+                }
+                if (ta.zero3_save_16bit_model) {
+                    accelerateFlags += ' --zero3_save_16bit_model true';
                 }
 
             } else {
@@ -1446,7 +1469,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
 
         // TP/SP: strip options that are incompatible with the TP training script.
         const launchMode = mergedConfig.training_arguments?.multigpu_mode
-            || (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp');
+            || (mergedConfig.training_arguments?.deepspeed ? 'deepspeed' : (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp'));
         if (launchMode === 'tp_sp' && mergedConfig.training_arguments) {
             mergedConfig.training_arguments.sequence_parallel = true;
             // Normalize tp_degree with NaN guard
@@ -1465,6 +1488,22 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         } else if (mergedConfig.training_arguments) {
             delete mergedConfig.training_arguments.no_fuse_qkv;
             delete mergedConfig.training_arguments.tp_backend;
+            delete mergedConfig.training_arguments.tp_degree;
+            delete mergedConfig.training_arguments.sequence_parallel;
+        }
+
+        if (mergedConfig.training_arguments && launchMode !== 'deepspeed') {
+            delete mergedConfig.training_arguments.deepspeed;
+            delete mergedConfig.training_arguments.zero_stage;
+            delete mergedConfig.training_arguments.offload_optimizer_device;
+            delete mergedConfig.training_arguments.offload_optimizer_nvme_path;
+            delete mergedConfig.training_arguments.offload_param_device;
+            delete mergedConfig.training_arguments.offload_param_nvme_path;
+            delete mergedConfig.training_arguments.zero3_init_flag;
+            delete mergedConfig.training_arguments.zero3_save_16bit_model;
+            delete mergedConfig.training_arguments.fp16_master_weights_and_gradients;
+        } else if (mergedConfig.training_arguments) {
+            mergedConfig.training_arguments.deepspeed = true;
         }
 
         // Convert Windows paths to WSL paths when running under WSL
@@ -1515,7 +1554,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         const { gpuEnv, accelerateFlags, tpTrainCmd } = launch;
 
         const resolvedMode = mergedConfig.training_arguments?.multigpu_mode
-            || (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp');
+            || (mergedConfig.training_arguments?.deepspeed ? 'deepspeed' : (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp'));
 
         let trainCmd;
         if (resolvedMode === 'tp_sp' && tpTrainCmd) {
