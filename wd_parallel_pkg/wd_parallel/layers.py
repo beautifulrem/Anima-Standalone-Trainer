@@ -37,6 +37,8 @@ from .collectives import (
     copy_to_tp_region_no_input_grad,
     _split_along_first_dim,
     _split_along_dim,
+    _ColumnLinearFwdBwd,
+    _RowLinearFwdBwd,
 )
 
 
@@ -463,6 +465,14 @@ class ColumnParallelLinear(nn.Module):
         return nn.functional.linear(x, self.weight, self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        adapter = getattr(self, "_tp_lora_adapter", None)
+        if adapter is not None:
+            # LoRA path: two-step gather + lora-augmented matmul (unchanged)
+            return adapter.forward_from_prepared_input(self._prepare_tp_input(x))
+        if self.sequence_parallel and self._group is not None and self._group.size() > 1:
+            # SP path: fused async Function (backward overlaps AG/RS with matmul)
+            return _ColumnLinearFwdBwd.apply(x, self.weight, self.bias, self._group, self.seq_dim)
+        # Non-SP or single-GPU: existing path (copy_to_tp_region for cross-attn KV)
         return self.forward_from_prepared_input(self._prepare_tp_input(x))
 
     def trim_full_output(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -581,16 +591,8 @@ class RowParallelLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.size(-1) < self.in_features:
             x = torch.nn.functional.pad(x, (0, self.in_features - x.size(-1)))
-        # Matmul without bias — bias must be added AFTER the collective,
-        # otherwise each rank contributes the full bias and the sum/scatter
-        # multiplies it by tp_size.
-        out = nn.functional.linear(x, self.weight, None)
-        if self._group is not None and self._group.size() > 1:
-            if self.sequence_parallel:
-                out = reduce_scatter_to_sp_region(out, self._group, self.seq_dim)
-            else:
-                out = out.contiguous()
-                dist.all_reduce(out, group=self._group)
-        if self.bias is not None:
-            out = out + self.bias
-        return out
+        # Fused async Function: matmul → reduce-scatter/all-reduce, bias added inside.
+        # Backward launches async AG of grad_out to enable cross-layer pipelining.
+        return _RowLinearFwdBwd.apply(
+            x, self.weight, self.bias, self._group, self.seq_dim, self.sequence_parallel
+        )

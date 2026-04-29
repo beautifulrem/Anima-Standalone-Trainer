@@ -1162,6 +1162,16 @@ def setup_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Required for async TP collective overlap
+    _cuda_max_conn = os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS")
+    if _cuda_max_conn is None:
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+    elif _cuda_max_conn != "1":
+        logger.warning(
+            f"CUDA_DEVICE_MAX_CONNECTIONS={_cuda_max_conn!r} (expected '1'). "
+            "Async TP collective overlap may not work correctly."
+        )
+
     parser = setup_parser()
     args = parser.parse_args()
     train_util.verify_command_line_training_args(args)

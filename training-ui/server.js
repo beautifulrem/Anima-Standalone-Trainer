@@ -1,81 +1,13 @@
 const express = require('express');
-const { spawn, execSync, execFileSync } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const TOML = require('@iarna/toml');
 const net = require('net');
 const http = require('http');
 const WebSocket = require('ws');
-const os = require('os');
 
-function execWindowsPowerShellSync(script, options = {}) {
-    return execFileSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
-        ...options,
-        stdio: options.stdio ?? 'pipe',
-        windowsHide: options.windowsHide ?? true
-    });
-}
-
-// Auto-install cuda_direct_backend Windows only
-(function ensureCudaDirectBackend() {
-    if (process.platform !== 'win32') return;
-    const ROOT_DIR_BOOTSTRAP = path.join(__dirname, '..');
-    const venvPath = path.join(ROOT_DIR_BOOTSTRAP, 'venv');
-    const pythonPath = path.join(venvPath, 'Scripts', 'python.exe');
-    const pythonCmd = fs.existsSync(pythonPath) ? `"${pythonPath}"` : 'python';
-    try {
-        execWindowsPowerShellSync(`${pythonCmd} -c "import cuda_direct_backend"`, { stdio: 'ignore' });
-    } catch {
-        const pkgPath = path.join(__dirname, '..', 'cuda_direct_pkg');
-        if (fs.existsSync(pkgPath)) {
-            console.log('[setup] Installing cuda_direct_backend...');
-            try {
-                execWindowsPowerShellSync(`${pythonCmd} -m pip install --no-deps -e "${pkgPath}"`, { stdio: 'pipe' });
-                console.log('[setup] cuda_direct_backend installed.\n');
-            } catch {
-                console.warn('[setup] Could not install cuda_direct_backend. Multi-GPU cuda_direct will be unavailable.\n');
-            }
-        }
-    }
-})();
-
-// Auto-install wd_parallel (all platforms)
-(function ensureWdParallel() {
-    const ROOT_DIR_BOOTSTRAP = path.join(__dirname, '..');
-    const venvPath = path.join(ROOT_DIR_BOOTSTRAP, 'venv');
-    let pythonCmd;
-    if (process.platform === 'win32') {
-        const pythonPath = path.join(venvPath, 'Scripts', 'python.exe');
-        pythonCmd = fs.existsSync(pythonPath) ? `"${pythonPath}"` : 'python';
-    } else {
-        const pythonPath = path.join(venvPath, 'bin', 'python');
-        pythonCmd = fs.existsSync(pythonPath) ? pythonPath : 'python3';
-    }
-
-    const pkgPath = path.join(__dirname, '..', 'wd_parallel_pkg');
-    if (!fs.existsSync(pkgPath)) return;
-
-    try {
-        if (process.platform === 'win32') {
-            execWindowsPowerShellSync(`${pythonCmd} -c "import wd_parallel"`, { stdio: 'ignore' });
-        } else {
-            execSync(`${pythonCmd} -c "import wd_parallel"`, { stdio: 'ignore' });
-        }
-    } catch {
-        console.log('[setup] Installing wd_parallel...');
-        try {
-            if (process.platform === 'win32') {
-                execWindowsPowerShellSync(`${pythonCmd} -m pip install --no-deps -e "${pkgPath}"`, { stdio: 'pipe' });
-            } else {
-                execSync(`${pythonCmd} -m pip install --no-deps -e '${pkgPath}'`, { stdio: 'pipe' });
-            }
-            console.log('[setup] wd_parallel installed.\n');
-        } catch (err) {
-            console.warn('[setup] Could not install wd_parallel. TP/SP training may be unavailable.');
-            console.warn(`[setup] To fix manually, run: pip install -e "${pkgPath}"\n`);
-        }
-    }
-})();
+require('./lib/setup').runSetup();
 
 const app = express();
 const server = http.createServer(app);
@@ -482,6 +414,12 @@ function buildTrainingConfig(jobName, jobPath) {
 
     delete merged.training_arguments.sample_every_n_epochs;
     delete merged.training_arguments.sample_every_n_steps;
+
+    // Convert freeze_llm_adapter flag → llm_adapter_lr: 0 (works for both DDP and TP+SP FFT)
+    if (merged.training_arguments.freeze_llm_adapter) {
+        merged.training_arguments.llm_adapter_lr = 0;
+    }
+    delete merged.training_arguments.freeze_llm_adapter;
 
     // Network arguments
     merged.network_arguments = { ...jobConfig.network_arguments };
@@ -1032,15 +970,20 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
 
         if (validIds.length > 1) {
             if (mode === 'tp_sp') {
-                const tpScript = jobArch.scripts?.train_network_tp_sp;
-                if (!tpScript)
-                    return { error: `TP/SP mode is not supported for the "${jobArch.id || 'current'}" architecture. No train_network_tp_sp script is defined.` };
+                const hasNet = !!(mergedConfig.network_arguments?.network_module);
+                const tpScript = hasNet
+                    ? jobArch.scripts?.train_network_tp_sp
+                    : jobArch.scripts?.train_tp_sp;
+                if (!tpScript) {
+                    const modeLabel = hasNet ? 'LoRA TP/SP' : 'Full Finetune TP/SP';
+                    return { error: `${modeLabel} is not supported for the "${jobArch.id || 'current'}" architecture.` };
+                }
                 const n = validIds.length;
                 const target = path.join(ROOT_DIR, tpScript);
                 // Validate tp_backend against whitelist
                 const allowedBackends = ['nccl', 'cuda_direct', 'gloo', 'mpi'];
-                const rawBackend = ta.tp_backend || (isWindows ? 'cuda_direct' : 'nccl');
-                const tpBackend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'cuda_direct' : 'nccl');
+                const rawBackend = ta.tp_backend || (isWindows ? 'gloo' : 'nccl');
+                const tpBackend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'gloo' : 'nccl');
                 tpTrainCmd = `python -m torch.distributed.run --nproc_per_node=${n} --master_addr 127.0.0.1 --master_port 29500 "${target}" --tp_degree ${n} --tp_backend ${tpBackend} --sequence_parallel --config_file="${mergedConfigPath}"`;
 
             } else if (mode === 'fsdp2') {
@@ -1512,8 +1455,8 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             mergedConfig.training_arguments.tp_degree = Math.max(2, tp);
             // Validate tp_backend against whitelist
             const allowedBackends = ['nccl', 'cuda_direct', 'gloo', 'mpi'];
-            const rawBackend = mergedConfig.training_arguments.tp_backend || (isWindows ? 'cuda_direct' : 'nccl');
-            mergedConfig.training_arguments.tp_backend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'cuda_direct' : 'nccl');
+            const rawBackend = mergedConfig.training_arguments.tp_backend || (isWindows ? 'gloo' : 'nccl');
+            mergedConfig.training_arguments.tp_backend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'gloo' : 'nccl');
             delete mergedConfig.training_arguments.use_cuda_direct;
             delete mergedConfig.training_arguments.save_state;
             delete mergedConfig.training_arguments.save_state_on_train_end;
@@ -1521,7 +1464,6 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             delete mergedConfig.training_arguments.save_last_n_epochs_state;
         } else if (mergedConfig.training_arguments) {
             delete mergedConfig.training_arguments.no_fuse_qkv;
-            delete mergedConfig.training_arguments.tp_async_overlap;
             delete mergedConfig.training_arguments.tp_backend;
         }
 
@@ -1922,207 +1864,26 @@ app.post('/api/jobs/:name/reset-config', (req, res) => {
 
 // --- Hardware Monitor ---
 
-let prevCpuInfo = null;
-const HW_MONITOR_INTERVAL_MS = 1000;
-
-function getCpuUsagePct() {
-    const cpus = os.cpus();
-    if (!prevCpuInfo) {
-        prevCpuInfo = cpus;
-        return 0;
-    }
-    let totalDelta = 0, idleDelta = 0;
-    cpus.forEach((cpu, i) => {
-        const prev = prevCpuInfo[i];
-        if (!prev) return;
-        const prevTotal = Object.values(prev.times).reduce((a, b) => a + b, 0);
-        const currTotal = Object.values(cpu.times).reduce((a, b) => a + b, 0);
-        totalDelta += currTotal - prevTotal;
-        idleDelta += cpu.times.idle - prev.times.idle;
-    });
-    prevCpuInfo = cpus;
-    if (totalDelta === 0) return 0;
-    return Math.round((1 - idleDelta / totalDelta) * 100);
-}
-
-function terminateChildProcess(child, { force = false } = {}) {
-    if (!child || child.pid == null) return;
-
-    if (isWindows) {
-        const args = ['/PID', String(child.pid), '/T'];
-        if (force) args.splice(2, 0, '/F');
-        const killer = spawn('taskkill', args, { stdio: 'ignore', windowsHide: true });
-        killer.on('error', () => { });
-        return;
-    }
-
-    const signal = force ? 'SIGKILL' : 'SIGTERM';
-    try {
-        process.kill(child.pid, signal);
-    } catch (_) {
-        try { process.kill(-child.pid, signal); } catch (__) { }
-    }
-}
-
-function runSingleFlightProbe(state, spawnChild, timeoutMs, parseResult) {
-    if (state.pending) return Promise.resolve(null);
-    state.pending = true;
-
-    return new Promise((resolve) => {
-        const child = spawnChild();
-        let stdout = '';
-        let settled = false;
-        let timedOut = false;
-        let forceKillTimer = null;
-
-        const finish = (value) => {
-            if (settled) return;
-            settled = true;
-            state.pending = false;
-            clearTimeout(timeout);
-            if (forceKillTimer) clearTimeout(forceKillTimer);
-            resolve(value);
-        };
-
-        const timeout = setTimeout(() => {
-            timedOut = true;
-            terminateChildProcess(child);
-            forceKillTimer = setTimeout(() => terminateChildProcess(child, { force: true }), 1500);
-        }, timeoutMs);
-
-        child.stdout.on('data', (data) => {
-            stdout += data;
-        });
-
-        child.on('close', (code) => {
-            if (timedOut || code !== 0) {
-                finish(null);
-                return;
-            }
-            try {
-                finish(parseResult(stdout));
-            } catch (_) {
-                finish(null);
-            }
-        });
-
-        child.on('error', () => {
-            finish(null);
-        });
-    });
-}
-
-const cpuTempProbeState = { pending: false };
-
-const gpuStatsProbeState = { pending: false };
-
-function getCpuTemp() {
-    return runSingleFlightProbe(
-        cpuTempProbeState,
-        () => {
-            if (isWindows) {
-                return spawn('powershell', [
-                    '-NoProfile', '-NonInteractive', '-Command',
-                    'Get-WmiObject -Namespace root/wmi -Class MSAcpi_ThermalZoneTemperature | Select-Object -ExpandProperty CurrentTemperature'
-                ], { windowsHide: true });
-            }
-
-            return spawn('bash', ['-c',
-                'paste -sd+ /sys/class/thermal/thermal_zone*/temp 2>/dev/null | bc'
-            ], { windowsHide: true });
-        },
-        4000,
-        (stdout) => {
-            if (!stdout.trim()) return null;
-
-            if (isWindows) {
-                const vals = stdout.trim().split('\n')
-                    .map(l => parseFloat(l.trim()))
-                    .filter(v => !isNaN(v) && v > 0);
-                if (!vals.length) return null;
-                return Math.round(vals.reduce((a, b) => a + b, 0) / vals.length / 10 - 273.15);
-            }
-
-            const val = parseFloat(stdout.trim());
-            return isNaN(val) ? null : Math.round(val / 1000);
-        }
-    );
-}
-
-function getGpuStats() {
-    return runSingleFlightProbe(
-        gpuStatsProbeState,
-        () => spawn('nvidia-smi', [
-            '--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit',
-            '--format=csv,noheader,nounits'
-        ], { windowsHide: true }),
-        3000,
-        (stdout) => {
-            if (!stdout.trim()) return null;
-
-            return stdout.trim().split('\n').map(line => {
-                const parts = line.split(',').map(s => s.trim());
-                return {
-                    index: parseInt(parts[0]),
-                    name: parts[1],
-                    util: parseInt(parts[2]) || 0,
-                    memUsed: parseInt(parts[3]) || 0,
-                    memTotal: parseInt(parts[4]) || 0,
-                    temp: parseInt(parts[5]) || 0,
-                    powerDraw: Math.round(parseFloat(parts[6])) || 0,
-                    powerLimit: Math.round(parseFloat(parts[7])) || 0
-                };
-            });
-        }
-    );
-}
-
-setInterval(async () => {
-    if (wss.clients.size === 0) return;
-
-    const cpuPct = getCpuUsagePct();
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-    const [gpus, cpuTemp] = await Promise.all([getGpuStats(), getCpuTemp()]);
-
-    if (gpus === null) return; // nvidia-smi busy or timed out -> skip this tick
-
-    // Mark active GPUs from running jobs
-    const activeGpus = {};
+function getActiveGpus() {
+    const active = {};
     for (const [, job] of runningJobs.entries()) {
         if (job.gpuIds) {
             job.gpuIds.split(',').forEach(id => {
                 const trimmed = id.trim();
-                if (trimmed) activeGpus[trimmed] = job.type === 'generation' ? 'sampling' : 'training';
+                if (trimmed) active[trimmed] = job.type === 'generation' ? 'sampling' : 'training';
             });
         }
     }
     if (persistentGenProcess && persistentGenProcess.gpuIds) {
         persistentGenProcess.gpuIds.split(',').forEach(id => {
             const trimmed = id.trim();
-            if (trimmed) activeGpus[trimmed] = 'sampling';
+            if (trimmed) active[trimmed] = 'sampling';
         });
     }
-    gpus.forEach(gpu => {
-        gpu.activity = activeGpus[String(gpu.index)] || null;
-    });
+    return active;
+}
 
-    const payload = JSON.stringify({
-        type: 'hw_stats',
-        data: {
-            cpu: cpuPct,
-            cpuTemp,
-            ram: { total: totalMem, used: totalMem - freeMem },
-            gpus
-        }
-    });
-
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(payload);
-        }
-    });
-}, HW_MONITOR_INTERVAL_MS);
+require('./lib/hardware').startHardwareMonitor(wss, getActiveGpus);
 
 // Prevent server crash on unhandled errors
 process.on('uncaughtException', (err) => {

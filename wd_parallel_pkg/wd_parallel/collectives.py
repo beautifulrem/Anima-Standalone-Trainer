@@ -473,6 +473,242 @@ class _CopyToTPRegion(torch.autograd.Function):
 
 
 # ---------------------------------------------------------------------------
+# Async helpers for fused linear backward overlap
+# ---------------------------------------------------------------------------
+
+def _async_all_gather_seq_dim(
+    input_: torch.Tensor,
+    group: dist.ProcessGroup,
+    seq_dim: int,
+):
+    """Non-blocking all-gather along seq_dim.
+
+    Returns (out_buf, handle, needs_back_transpose).
+    After handle.wait(), caller must do out_buf.transpose(0, seq_dim).contiguous()
+    when needs_back_transpose is True to restore the original layout.
+
+    Fresh (non-pooled) buffers are always used so concurrent async ops don't
+    alias each other's storage.
+
+    Requires CUDA_DEVICE_MAX_CONNECTIONS=1 for compute-comm overlap to work.
+    """
+    world_size = group.size()
+    if seq_dim == 0:
+        x = input_.contiguous()
+        out_shape = (x.size(0) * world_size,) + x.shape[1:]
+        buf = torch.empty(out_shape, dtype=x.dtype, device=x.device)
+        handle = dist.all_gather_into_tensor(buf, x, group=group, async_op=True)
+        return buf, handle, False
+    else:
+        x = input_.transpose(0, seq_dim).contiguous()
+        out_shape = (x.size(0) * world_size,) + x.shape[1:]
+        buf = torch.empty(out_shape, dtype=x.dtype, device=x.device)
+        handle = dist.all_gather_into_tensor(buf, x, group=group, async_op=True)
+        return buf, handle, True
+
+
+def _async_reduce_scatter_seq_dim(
+    input_: torch.Tensor,
+    group: dist.ProcessGroup,
+    seq_dim: int,
+):
+    """Non-blocking reduce-scatter along seq_dim.
+
+    Returns (out_buf, handle, needs_back_transpose).
+    After handle.wait(), caller must do out_buf.transpose(0, seq_dim).contiguous()
+    when needs_back_transpose is True to restore the original layout.
+    """
+    world_size = group.size()
+    if seq_dim == 0:
+        x = input_.contiguous()
+        out_shape = (x.size(0) // world_size,) + x.shape[1:]
+        buf = torch.empty(out_shape, dtype=x.dtype, device=x.device)
+        handle = dist.reduce_scatter_tensor(buf, x, group=group, async_op=True)
+        return buf, handle, False
+    else:
+        x = input_.transpose(0, seq_dim).contiguous()
+        out_shape = (x.size(0) // world_size,) + x.shape[1:]
+        buf = torch.empty(out_shape, dtype=x.dtype, device=x.device)
+        handle = dist.reduce_scatter_tensor(buf, x, group=group, async_op=True)
+        return buf, handle, True
+
+
+class _ColumnLinearFwdBwd(torch.autograd.Function):
+    """Fused column-parallel linear with async backward overlap.
+
+    Forward  (sync):  all-gather input along seq_dim → matmul.
+    Backward (async, requires CUDA_DEVICE_MAX_CONNECTIONS=1):
+      1. async AG(saved input shard)              -- enqueue, return handle
+      2. grad_input = grad_out @ weight           -- overlaps with AG
+      3. async RS(grad_input → SP region)         -- enqueue, return handle
+      4. handle_ag.wait()
+      5. wgrad = grad_out_2d.T @ gathered_2d      -- overlaps with RS
+      6. handle_rs.wait()
+      -> return sharded grad_input, wgrad, grad_bias
+
+    When weight.requires_grad is False (frozen base in LoRA training):
+      steps 1/4/5 are skipped — only 2/3/6.
+    """
+
+    @staticmethod
+    def forward(ctx, input_, weight, bias, group, seq_dim):
+        ctx.save_for_backward(input_, weight)
+        ctx.group            = group
+        ctx.seq_dim          = seq_dim
+        ctx.use_bias         = bias is not None
+        ctx.input_dtype      = input_.dtype
+        ctx.weight_needs_grad = weight.requires_grad
+
+        if group is not None and group.size() > 1:
+            gathered = _gather_along_dim(input_, group, seq_dim, buf_name="col_fwd_gather")
+        else:
+            gathered = input_
+
+        return torch.nn.functional.linear(gathered, weight, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_, weight = ctx.saved_tensors
+        group   = ctx.group
+        seq_dim = ctx.seq_dim
+
+        # Cast grad to weight dtype — weight.dtype is authoritative for matmul ops.
+        # ctx.input_dtype may be fp32 when AMP autocast upcasts activations, while
+        # the weight stays in bf16; casting to input_dtype then matmul-ing with bf16
+        # weight would crash.
+        if grad_output.dtype != weight.dtype:
+            grad_output = grad_output.to(weight.dtype)
+
+        do_async = group is not None and group.size() > 1
+
+        # Step 1: async AG of saved input shard (for wgrad) — launch before grad_input matmul
+        # CUDA_DEVICE_MAX_CONNECTIONS=1 ensures AG is enqueued before the matmul kernel below.
+        if do_async and ctx.weight_needs_grad:
+            ag_buf, ag_handle, ag_transpose = _async_all_gather_seq_dim(input_, group, seq_dim)
+        else:
+            ag_buf = ag_handle = ag_transpose = None
+
+        # Step 2: grad_input (full sequence) — overlaps with AG when weight_needs_grad=True
+        grad_input_full = grad_output.matmul(weight)
+
+        # Step 3: async RS of grad_input back to SP region
+        if do_async:
+            rs_buf, rs_handle, rs_transpose = _async_reduce_scatter_seq_dim(
+                grad_input_full, group, seq_dim
+            )
+
+        # Step 4+5: wait for AG, compute wgrad (overlaps with RS)
+        if ag_handle is not None:
+            ag_handle.wait()
+            gathered = ag_buf.transpose(0, seq_dim).contiguous() if ag_transpose else ag_buf
+            if gathered.dtype != weight.dtype:
+                gathered = gathered.to(weight.dtype)
+            gathered_2d = gathered.reshape(-1, weight.shape[1])
+            grad_out_2d = grad_output.reshape(-1, grad_output.shape[-1])
+            grad_weight = grad_out_2d.t().matmul(gathered_2d)
+        elif ctx.weight_needs_grad:
+            # Single-GPU: full input is already on this rank
+            inp = input_.to(weight.dtype) if input_.dtype != weight.dtype else input_
+            inp_2d      = inp.reshape(-1, weight.shape[1])
+            grad_out_2d = grad_output.reshape(-1, grad_output.shape[-1])
+            grad_weight = grad_out_2d.t().matmul(inp_2d)
+        else:
+            grad_weight = None
+
+        # Step 6: wait for RS, restore layout
+        if do_async:
+            rs_handle.wait()
+            grad_input = rs_buf.transpose(0, seq_dim).contiguous() if rs_transpose else rs_buf
+        else:
+            grad_input = grad_input_full
+
+        grad_bias = (
+            grad_output.sum(list(range(grad_output.ndim - 1))) if ctx.use_bias else None
+        )
+
+        return (grad_input, grad_weight, grad_bias, None, None)  # group, seq_dim: no grad
+
+
+class _RowLinearFwdBwd(torch.autograd.Function):
+    """Fused row-parallel linear with async backward AG.
+
+    Forward  (sync):  matmul with feature-sharded input → reduce-scatter to SP region.
+    Backward:
+      1. async AG(grad_out SP shard)              -- gather gradient to full sequence
+      2. handle.wait()                            -- both grad_input and wgrad need full grad_out
+      3. grad_input = grad_out_full @ weight      -- feature-sharded, no collective
+      4. wgrad      = grad_out_2d.T @ input_2d   -- local, no collective
+      -> return grad_input, wgrad, grad_bias
+
+    No inner overlap in RowParallel backward (unlike Column), but async AG enables
+    cross-layer pipelining when CUDA_DEVICE_MAX_CONNECTIONS=1 is set.
+    """
+
+    @staticmethod
+    def forward(ctx, input_, weight, bias, group, seq_dim, sequence_parallel):
+        ctx.save_for_backward(input_, weight)
+        ctx.group             = group
+        ctx.seq_dim           = seq_dim
+        ctx.sequence_parallel = sequence_parallel
+        ctx.use_bias          = bias is not None
+        ctx.input_dtype       = input_.dtype
+        ctx.weight_needs_grad = weight.requires_grad
+
+        # Bias added AFTER collective to avoid tp_size-times accumulation
+        out = torch.nn.functional.linear(input_, weight, None)
+
+        if group is not None and group.size() > 1:
+            if sequence_parallel:
+                out = _reduce_scatter_along_dim(out, group, seq_dim, buf_name="row_fwd_rs")
+            else:
+                out = out.contiguous()
+                dist.all_reduce(out, group=group)
+
+        if bias is not None:
+            out = out + bias
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_, weight = ctx.saved_tensors
+        group   = ctx.group
+        seq_dim = ctx.seq_dim
+        sp      = ctx.sequence_parallel
+
+        # Cast to weight dtype — same AMP reason as _ColumnLinearFwdBwd.
+        if grad_output.dtype != weight.dtype:
+            grad_output = grad_output.to(weight.dtype)
+
+        do_async = group is not None and group.size() > 1
+
+        # Step 1+2: async AG of SP-sharded grad_out to full sequence
+        if do_async and sp:
+            ag_buf, ag_handle, ag_transpose = _async_all_gather_seq_dim(grad_output, group, seq_dim)
+            ag_handle.wait()
+            grad_out_full = ag_buf.transpose(0, seq_dim).contiguous() if ag_transpose else ag_buf
+        else:
+            grad_out_full = grad_output
+
+        # Step 3: grad_input — feature-sharded (matches row-parallel weight shard)
+        grad_input = grad_out_full.matmul(weight)
+
+        # Step 4: wgrad — fully local, no collective needed
+        if ctx.weight_needs_grad:
+            inp = input_.to(weight.dtype) if input_.dtype != weight.dtype else input_
+            inp_2d      = inp.reshape(-1, weight.shape[1])
+            grad_out_2d = grad_out_full.reshape(-1, grad_out_full.shape[-1])
+            grad_weight = grad_out_2d.t().matmul(inp_2d)
+        else:
+            grad_weight = None
+
+        grad_bias = (
+            grad_output.sum(list(range(grad_output.ndim - 1))) if ctx.use_bias else None
+        )
+
+        return (grad_input, grad_weight, grad_bias, None, None, None)  # group, seq_dim, sp: no grad
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 

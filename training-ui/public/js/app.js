@@ -428,7 +428,6 @@ function populateConfig(config) {
   if ($("cfg-tp-backend")) $("cfg-tp-backend").value = t.tp_backend || "auto";
   $("cfg-sequence-parallel").checked = true;
   if ($("cfg-no-fuse-qkv")) $("cfg-no-fuse-qkv").checked = t.no_fuse_qkv ?? false;
-  if ($("cfg-tp-async-overlap")) $("cfg-tp-async-overlap").checked = t.tp_async_overlap ?? false;
   $("cfg-fsdp-sharding-strategy").value = t.fsdp_sharding_strategy || "1";
   $("cfg-fsdp-offload-params").checked = t.fsdp_offload_params ?? false;
   $("cfg-fsdp-reshard-after-forward").checked =
@@ -497,12 +496,16 @@ function populateConfig(config) {
   // Anima
   $("cfg-timestep-method").value = a.timestep_sample_method || "logit_normal";
   $("cfg-flow-shift").value = a.discrete_flow_shift ?? 3.0;
-  // Network
+  // Network / Training type
+  const trainingType = n.network_module ? "lora" : "full_finetune";
+  $("cfg-training-type").value = trainingType;
+  updateTrainingTypeUI(trainingType);
   $("cfg-network-module").value = n.network_module || "networks.lora_anima";
   $("cfg-network-dim").value = n.network_dim ?? 16;
   $("cfg-network-alpha").value = n.network_alpha ?? 16;
   $("cfg-unet-only").checked = n.network_train_unet_only ?? true;
   $("cfg-network-weights").value = n.network_weights || "";
+  $("cfg-freeze-llm-adapter").checked = t.freeze_llm_adapter ?? true;
   $("cfg-auto-resume").checked = n.auto_resume_last_state ?? false;
   $("cfg-resume").value = n.resume || "";
   $("cfg-resume").disabled = $("cfg-auto-resume").checked;
@@ -689,7 +692,6 @@ function gatherConfig() {
               tp_backend: $("cfg-tp-backend")?.value || "auto",
               sequence_parallel: true,
               ...($("cfg-no-fuse-qkv")?.checked ? { no_fuse_qkv: true } : {}),
-              ...($("cfg-tp-async-overlap")?.checked ? { tp_async_overlap: true } : {}),
             }
           : {}),
       use_cuda_direct:
@@ -733,6 +735,10 @@ function gatherConfig() {
       fsdp2_auto_wrap_policy: $("cfg-fsdp2-auto-wrap-policy").value,
       fsdp2_min_num_params: safeInt($("cfg-fsdp2-min-num-params").value),
       fsdp2_transformer_layer_cls_to_wrap: $("cfg-fsdp2-layer-to-wrap").value.trim(),
+      // FFT options
+      ...($("cfg-training-type").value === "full_finetune" && $("cfg-freeze-llm-adapter").checked
+        ? { freeze_llm_adapter: true }
+        : {}),
       // Diagnostics
       step_profile: $("cfg-step-profile").checked,
       profile_microbatch: $("cfg-profile-microbatch").checked,
@@ -749,23 +755,28 @@ function gatherConfig() {
         return { resolution_schedule: parts.join(",") };
       })(),
     },
-    network_arguments: {
-      network_module: $("cfg-network-module").value,
-      network_dim: safeInt($("cfg-network-dim").value),
-      network_alpha: safeInt($("cfg-network-alpha").value),
-      network_train_unet_only: $("cfg-unet-only").checked,
-      ...(safeFloat($("cfg-network-dropout").value) > 0 && {
-        network_dropout: safeFloat($("cfg-network-dropout").value),
-      }),
-      ...($("cfg-network-args").value.trim() && {
-        network_args: $("cfg-network-args").value.trim().split(/\s+/),
-      }),
-      ...($("cfg-network-weights").value && {
-        network_weights: $("cfg-network-weights").value,
-      }),
-      auto_resume_last_state: $("cfg-auto-resume").checked,
-      ...($("cfg-resume").value && !$("cfg-auto-resume").checked && { resume: $("cfg-resume").value }),
-    },
+    network_arguments: $("cfg-training-type").value === "full_finetune"
+      ? {
+          auto_resume_last_state: $("cfg-auto-resume").checked,
+          ...($("cfg-resume").value && !$("cfg-auto-resume").checked && { resume: $("cfg-resume").value }),
+        }
+      : {
+          network_module: $("cfg-network-module").value,
+          network_dim: safeInt($("cfg-network-dim").value),
+          network_alpha: safeInt($("cfg-network-alpha").value),
+          network_train_unet_only: $("cfg-unet-only").checked,
+          ...(safeFloat($("cfg-network-dropout").value) > 0 && {
+            network_dropout: safeFloat($("cfg-network-dropout").value),
+          }),
+          ...($("cfg-network-args").value.trim() && {
+            network_args: $("cfg-network-args").value.trim().split(/\s+/),
+          }),
+          ...($("cfg-network-weights").value && {
+            network_weights: $("cfg-network-weights").value,
+          }),
+          auto_resume_last_state: $("cfg-auto-resume").checked,
+          ...($("cfg-resume").value && !$("cfg-auto-resume").checked && { resume: $("cfg-resume").value }),
+        },
     anima_arguments: {
       timestep_sample_method: $("cfg-timestep-method").value,
       discrete_flow_shift: safeFloat($("cfg-flow-shift").value),
@@ -1077,6 +1088,17 @@ function discardChanges() {
 $("cfg-step-profile").addEventListener("change", (e) => {
   $("cfg-profile-microbatch-group").style.display = e.target.checked ? "" : "none";
   if (!e.target.checked) $("cfg-profile-microbatch").checked = false;
+});
+
+// Show/hide LoRA-specific fields based on training type
+function updateTrainingTypeUI(type) {
+  const isLora = type === "lora";
+  $("lora-config-section").classList.toggle("hidden", !isLora);
+  $("fft-config-section").classList.toggle("hidden", isLora);
+}
+$("cfg-training-type").addEventListener("change", (e) => {
+  updateTrainingTypeUI(e.target.value);
+  checkDirty();
 });
 
 // Disable manual resume path when auto-resume is enabled
