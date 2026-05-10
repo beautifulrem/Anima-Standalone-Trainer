@@ -1734,7 +1734,13 @@ def get_dit_config(state_dict, key_prefix=''):
     dit_config["use_adaln_lora"] = True
     dit_config["adaln_lora_dim"] = 256
     if dit_config["model_channels"] == 2048:
-        dit_config["num_blocks"] = 28
+        # The 40-layer Anima checkpoint uses interleaved block insertion, so any
+        # tensor under blocks.39.* is enough to distinguish it from the 28-layer base.
+        has_40_blocks = any(
+            key.startswith(f"{key_prefix}blocks.39.")
+            for key in state_dict.keys()
+        )
+        dit_config["num_blocks"] = 40 if has_40_blocks else 28
         dit_config["num_heads"] = 16
     elif dit_config["model_channels"] == 5120:
         dit_config["num_blocks"] = 36

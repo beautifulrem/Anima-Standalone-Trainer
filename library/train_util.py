@@ -4037,6 +4037,18 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="enable static_graph for DDP / DDPでstatic_graphを有効にする",
     )
     parser.add_argument(
+        "--ddp_find_unused_parameters",
+        action="store_true",
+        default=False,
+        help="enable find_unused_parameters for DDP — required for models with >2.1B parameters to avoid int32 overflow in the gradient reducer",
+    )
+    parser.add_argument(
+        "--ddp_bucket_cap_mb",
+        type=int,
+        default=None,
+        help="gradient bucket size in MB for DDP (default: 25). Larger values mean fewer AllReduce ops and faster training.",
+    )
+    parser.add_argument(
         "--use_cuda_direct",
         action="store_true",
         help="(Windows multi-GPU only) use cuda_direct backend for GPU-to-GPU transfers instead of Gloo."
@@ -5554,9 +5566,12 @@ def prepare_accelerator(args: argparse.Namespace):
         ),
         (
             DistributedDataParallelKwargs(
-                gradient_as_bucket_view=args.ddp_gradient_as_bucket_view, static_graph=args.ddp_static_graph
+                gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
+                static_graph=args.ddp_static_graph,
+                find_unused_parameters=getattr(args, 'ddp_find_unused_parameters', False),
+                bucket_cap_mb=getattr(args, 'ddp_bucket_cap_mb', None) or 25,
             )
-            if args.ddp_gradient_as_bucket_view or args.ddp_static_graph
+            if args.ddp_gradient_as_bucket_view or args.ddp_static_graph or getattr(args, 'ddp_find_unused_parameters', False) or getattr(args, 'ddp_bucket_cap_mb', None)
             else None
         ),
     ]

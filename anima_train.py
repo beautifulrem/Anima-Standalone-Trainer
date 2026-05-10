@@ -20,7 +20,17 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from accelerate.utils import set_seed
-from library import deepspeed_utils, anima_models, anima_train_utils, anima_utils, save_utils, strategy_base, strategy_anima, sai_model_spec
+from library import (
+    deepspeed_utils,
+    anima_block_freeze,
+    anima_models,
+    anima_train_utils,
+    anima_utils,
+    save_utils,
+    strategy_base,
+    strategy_anima,
+    sai_model_spec,
+)
 
 import library.train_util as train_util
 
@@ -488,6 +498,25 @@ class AnimaTrainer:
 
         train_dit = args.learning_rate != 0
         dit.requires_grad_(train_dit)
+        if train_dit and getattr(args, "freeze_inserted_only_training", False):
+            freeze_summary = anima_block_freeze.apply_inserted_only_training_freeze(dit)
+            accelerator.print(
+                f"freeze_inserted_only_training: enabled for {freeze_summary['block_count']}-block Anima DiT"
+            )
+            accelerator.print(
+                f"  inserted trainable blocks: {freeze_summary['inserted_block_indices']}"
+            )
+            accelerator.print(
+                f"  frozen inherited blocks: {freeze_summary['inherited_block_indices']}"
+            )
+            accelerator.print(
+                f"  trainable parameters after freeze: {freeze_summary['trainable_parameter_count']:,}"
+            )
+            if freeze_summary["non_block_trainable_names"]:
+                accelerator.print(
+                    "  warning: non-block parameters remained trainable after freeze: "
+                    f"{freeze_summary['non_block_trainable_names'][:10]}"
+                )
         if not train_dit:
             dit.to(accelerator.device, dtype=weight_dtype)
 

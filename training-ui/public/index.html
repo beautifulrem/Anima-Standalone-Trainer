@@ -189,6 +189,10 @@
                                     <label>Save Every N Epochs</label>
                                     <input type="number" id="cfg-save-every" value="1" min="1">
                                 </div>
+                                <div class="form-group">
+                                    <label>Keep Last N Epochs</label>
+                                    <input type="number" id="cfg-save-last-n-epochs" value="0" min="0" title="0 = keep all">
+                                </div>
                             </div>
                         </div>
 
@@ -203,10 +207,12 @@
                                     <label>Save Every N Steps</label>
                                     <input type="number" id="cfg-save-every-steps" value="500" min="1">
                                 </div>
+                                <div class="form-group">
+                                    <label>Keep Last N Steps</label>
+                                    <input type="number" id="cfg-save-last-n-steps" value="0" min="0" title="0 = keep all">
+                                </div>
                             </div>
                         </div>
-
-
 
                         <div class="form-row">
                             <div class="form-group">
@@ -395,6 +401,37 @@
                             <small>Keeps DataLoader order within resolution buckets.</small>
                         </div>
 
+                        <h4>Validation</h4>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-enable-validation"> Enable Loss Validation</label>
+                            <small>Holds out a portion of training data to compute validation loss. Only available with LoRA.</small>
+                        </div>
+                        <div id="group-validation" class="hidden" style="padding-left: 16px; border-left: 2px solid var(--border); margin-top: 10px; display: flex; flex-direction: column; gap: 12px;">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Validation Split</label>
+                                    <input type="number" id="cfg-validation-split" value="0.1" min="0.01" max="0.5" step="0.01">
+                                </div>
+                                <div class="form-group">
+                                    <label>Validation Seed</label>
+                                    <input type="number" id="cfg-validation-seed" value="42">
+                                </div>
+                            </div>
+                            <div class="form-group" id="container-validate-every-epochs">
+                                <label>Validate Every N Epochs</label>
+                                <input type="number" id="cfg-validate-every-epochs" value="1" min="1">
+                            </div>
+                            <div class="form-group hidden" id="container-validate-every-steps">
+                                <label>Validate Every N Steps</label>
+                                <input type="number" id="cfg-validate-every-steps" value="500" min="1">
+                            </div>
+                            <div class="form-group">
+                                <label>Max Validation Steps</label>
+                                <input type="number" id="cfg-max-validation-steps" value="10" min="1">
+                                <small>Max batches (= batch size) per validation run.</small>
+                            </div>
+                        </div>
+
                         <div
                             style="display: flex; justify-content: space-between; align-items: center; margin-top: 24px;">
                             <h4>Dataset Folders</h4>
@@ -466,7 +503,11 @@
                             <h4>Full Finetune Options</h4>
                             <div class="form-group">
                                 <label><input type="checkbox" id="cfg-freeze-llm-adapter" checked> Freeze LLM Adapter</label>
-                                <small>Keep the LLM adapter weights frozen during training. Recommended — the adapter is pre-trained and retraining it risks degrading text understanding and causes DDP graph errors.</small>
+                                <small>Keep the LLM adapter weights frozen during training.</small>
+                            </div>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-freeze-inserted-only-training"> Train Inserted 12 Blocks Only</label>
+                                <small>For the 40-layer expanded Anima checkpoint, freeze inherited weights and train only the interleaved inserted blocks. To continue with all 40 blocks, start a new run from a saved model checkpoint with this option turned off.</small>
                             </div>
                         </div>
 
@@ -661,6 +702,13 @@
                             <div style="margin-top: 12px;">
                                 <label title="Tells DDP the computation graph is identical every step (same layers, same order). Enables more aggressive comm/compute overlap. Safe for standard UNet/DiT architectures."><input type="checkbox" id="cfg-ddp-static-graph"> Static Graph</label>
                                 <small>Allows DDP to overlap communication and computation more aggressively. Recommended when model structure does not change between steps.</small>
+                            </div>
+                            <div style="margin-top: 12px;">
+                                <label><input type="checkbox" id="cfg-ddp-find-unused-parameters" checked> Find Unused Parameters</label>
+                            </div>
+                            <div style="margin-top: 12px;">
+                                <label>Bucket Cap (MB)</label>
+                                <input type="number" id="cfg-ddp-bucket-cap-mb" value="25" min="1">
                             </div>
                         </div>
 

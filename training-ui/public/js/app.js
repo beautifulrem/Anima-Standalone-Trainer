@@ -376,8 +376,10 @@ function populateConfig(config) {
   updateDurationUnit();
   $("cfg-max-epochs").value = t.max_train_epochs ?? 20;
   $("cfg-save-every").value = t.save_every_n_epochs ?? 1;
+  $("cfg-save-last-n-epochs").value = t.save_last_n_epochs ?? 0;
   $("cfg-max-steps").value = t.max_train_steps ?? 1000;
   $("cfg-save-every-steps").value = t.save_every_n_steps ?? 500;
+  $("cfg-save-last-n-steps").value = t.save_last_n_steps ?? 0;
   $("cfg-output-name").value = t.output_name || "my_anima_lora";
   $("cfg-save-format").value = t.save_model_as || "safetensors";
   $("cfg-save-precision").value = t.save_precision || "bf16";
@@ -419,6 +421,8 @@ function populateConfig(config) {
   $("cfg-ddp-gradient-as-bucket-view").checked =
     t.ddp_gradient_as_bucket_view ?? false;
   $("cfg-ddp-static-graph").checked = t.ddp_static_graph ?? false;
+  $("cfg-ddp-find-unused-parameters").checked = t.ddp_find_unused_parameters ?? true;
+  $("cfg-ddp-bucket-cap-mb").value = t.ddp_bucket_cap_mb ?? 25;
   // Multi-GPU mode selector (ddp/fsdp/fsdp2/deepspeed/tp_sp) — backward compat: infer from use_fsdp
   const restoredMode =
     t.multigpu_mode || (t.deepspeed ? "deepspeed" : t.use_fsdp ? "fsdp" : "ddp");
@@ -509,6 +513,15 @@ function populateConfig(config) {
   $("cfg-sample-every").value = sampleInterval || 1;
   $("cfg-sample-every-steps").value = sampleIntervalSteps || 100;
   $("group-sample-every").classList.toggle("hidden", !enableSampling);
+  // Validation
+  const enableValidation = (t.validation_split ?? 0) > 0;
+  $("cfg-enable-validation").checked = enableValidation;
+  $("group-validation").classList.toggle("hidden", !enableValidation);
+  $("cfg-validation-split").value = t.validation_split || 0.1;
+  $("cfg-validation-seed").value = t.validation_seed ?? 42;
+  $("cfg-validate-every-epochs").value = t.validate_every_n_epochs ?? 1;
+  $("cfg-validate-every-steps").value = t.validate_every_n_steps ?? 500;
+  $("cfg-max-validation-steps").value = t.max_validation_steps ?? 10;
   // Anima
   $("cfg-timestep-method").value = a.timestep_sample_method || "logit_normal";
   $("cfg-flow-shift").value = a.discrete_flow_shift ?? 3.0;
@@ -522,6 +535,8 @@ function populateConfig(config) {
   $("cfg-unet-only").checked = n.network_train_unet_only ?? true;
   $("cfg-network-weights").value = n.network_weights || "";
   $("cfg-freeze-llm-adapter").checked = t.freeze_llm_adapter ?? true;
+  $("cfg-freeze-inserted-only-training").checked =
+    t.freeze_inserted_only_training ?? false;
   $("cfg-auto-resume").checked = n.auto_resume_last_state ?? false;
   $("cfg-resume").value = n.resume || "";
   $("cfg-resume").disabled = $("cfg-auto-resume").checked;
@@ -646,6 +661,9 @@ function gatherConfig() {
       save_every_n_epochs: isEpochs
         ? safeInt($("cfg-save-every").value)
         : undefined,
+      save_last_n_epochs: isEpochs
+        ? (safeInt($("cfg-save-last-n-epochs").value) || undefined)
+        : undefined,
       sample_every_n_epochs:
         isEpochs && enableSampling
           ? safeInt($("cfg-sample-every").value)
@@ -655,6 +673,9 @@ function gatherConfig() {
         : undefined,
       save_every_n_steps: !isEpochs
         ? safeInt($("cfg-save-every-steps").value)
+        : undefined,
+      save_last_n_steps: !isEpochs
+        ? (safeInt($("cfg-save-last-n-steps").value) || undefined)
         : undefined,
       sample_every_n_steps:
         !isEpochs && enableSampling
@@ -694,6 +715,19 @@ function gatherConfig() {
       }),
       persistent_data_loader_workers: $("cfg-persistent-workers").checked,
       seed: safeInt($("cfg-seed").value),
+      ...($("cfg-enable-validation").checked && {
+        validation_split: safeFloat($("cfg-validation-split").value),
+      }),
+      ...(isEpochs && $("cfg-enable-validation").checked
+        ? { validate_every_n_epochs: safeInt($("cfg-validate-every-epochs").value) }
+        : {}),
+      ...(!isEpochs && $("cfg-enable-validation").checked
+        ? { validate_every_n_steps: safeInt($("cfg-validate-every-steps").value) }
+        : {}),
+      ...($("cfg-enable-validation").checked && {
+        max_validation_steps: safeInt($("cfg-max-validation-steps").value),
+        validation_seed: safeInt($("cfg-validation-seed").value),
+      }),
       cache_latents_to_disk: $("cfg-cache-latents").checked,
       vae_batch_size: safeInt($("cfg-vae-batch").value),
       cache_text_encoder_outputs_to_disk: $("cfg-cache-te").checked,
@@ -742,6 +776,8 @@ function gatherConfig() {
         ? $("cfg-ddp-gradient-as-bucket-view").checked
         : false,
       ddp_static_graph: isMultiGpu ? $("cfg-ddp-static-graph").checked : false,
+      ddp_find_unused_parameters: isMultiGpu ? $("cfg-ddp-find-unused-parameters").checked : false,
+      ddp_bucket_cap_mb: isMultiGpu ? (safeInt($("cfg-ddp-bucket-cap-mb").value) || 25) : 25,
       // FSDP Configs
       use_fsdp: isMultiGpu
         ? multiGpuMode === "fsdp" || multiGpuMode === "fsdp2"
@@ -773,6 +809,10 @@ function gatherConfig() {
       // FFT options
       ...($("cfg-training-type").value === "full_finetune" && $("cfg-freeze-llm-adapter").checked
         ? { freeze_llm_adapter: true }
+        : {}),
+      ...($("cfg-training-type").value === "full_finetune" &&
+      $("cfg-freeze-inserted-only-training").checked
+        ? { freeze_inserted_only_training: true }
         : {}),
       // Diagnostics
       step_profile: $("cfg-step-profile").checked,
@@ -2570,6 +2610,9 @@ document.querySelectorAll(".tab").forEach((tab) => {
 $("cfg-enable-sampling").addEventListener("change", (e) => {
   $("group-sample-every").classList.toggle("hidden", !e.target.checked);
 });
+$("cfg-enable-validation").addEventListener("change", (e) => {
+  $("group-validation").classList.toggle("hidden", !e.target.checked);
+});
 document.querySelectorAll('input[name="duration-unit"]').forEach((el) => {
   el.addEventListener("change", updateDurationUnit);
 });
@@ -2582,6 +2625,8 @@ function updateDurationUnit() {
   $("schedule-steps").classList.toggle("hidden", isEpochs);
   $("container-sample-every-epochs").classList.toggle("hidden", !isEpochs);
   $("container-sample-every-steps").classList.toggle("hidden", isEpochs);
+  $("container-validate-every-epochs").classList.toggle("hidden", !isEpochs);
+  $("container-validate-every-steps").classList.toggle("hidden", isEpochs);
 }
 // Multiple Datasets
 const btnAddDataset = $("btn-add-dataset");

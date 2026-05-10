@@ -144,6 +144,14 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Use Flash Attention for DiT self/cross-attention (requires flash-attn package).",
     )
+    parser.add_argument(
+        "--freeze_inserted_only_training",
+        action="store_true",
+        help=(
+            "For the 40-layer expanded Anima checkpoint, freeze inherited weights and train only the "
+            "12 inserted interleaved blocks. Requires the 40-layer checkpoint."
+        ),
+    )
 
 
 # Noise & Timestep sampling (Rectified Flow)
@@ -275,6 +283,9 @@ def get_anima_param_groups(
     llm_adapter_params = []
 
     for name, p in dit.named_parameters():
+        if not p.requires_grad:
+            continue
+
         # Store original name for debugging
         p.original_name = name
 

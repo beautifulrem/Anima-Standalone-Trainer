@@ -1072,8 +1072,7 @@ function spawnShell(script, cwd) {
     if (isWindows) {
         return spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
             cwd,
-            stdio: ['pipe', 'pipe', 'pipe'],
-            detached: true
+            stdio: ['pipe', 'pipe', 'pipe']
         });
     } else {
         return spawn('bash', ['-c', script], {
