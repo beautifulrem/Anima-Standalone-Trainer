@@ -905,7 +905,8 @@ function openNative(target, isUrl = false) {
     } else if (process.platform === 'darwin') {
         spawn('open', [target]);
     } else {
-        spawn('xdg-open', [target]);
+        const proc = spawn('xdg-open', [target]);
+        proc.on('error', () => {}); // silently ignore — headless servers don't have xdg-open
     }
 }
 
