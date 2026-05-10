@@ -2059,6 +2059,9 @@ class NetworkTrainer:
         accelerator.end_training()
         optimizer_eval_fn()
 
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
         if (is_main_process or tp_collective_save) and (args.save_state or args.save_state_on_train_end):
             train_util.save_state_on_train_end(args, accelerator)
 

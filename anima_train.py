@@ -1158,6 +1158,10 @@ class AnimaTrainer:
         optimizer_eval_fn()
 
         del accelerator
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
         self.on_cleanup()
 
 
