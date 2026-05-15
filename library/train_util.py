@@ -1978,6 +1978,7 @@ class DreamBoothDataset(BaseDataset):
 
             info_cache_file = os.path.join(subset.image_dir, self.IMAGE_INFO_CACHE_FILE)
             use_cached_info_for_subset = subset.cache_info
+            actual_paths = None
             if use_cached_info_for_subset:
                 logger.info(
                     f"using cached image info for this subset / このサブセットで、キャッシュされた画像情報を使います: {info_cache_file}"
@@ -1993,12 +1994,25 @@ class DreamBoothDataset(BaseDataset):
                 # json: {`img_path`:{"caption": "caption...", "resolution": [width, height]}, ...}
                 with open(info_cache_file, "r", encoding="utf-8") as f:
                     metas = json.load(f)
-                img_paths = list(metas.keys())
-                sizes: List[Optional[Tuple[int, int]]] = [meta["resolution"] for meta in metas.values()]
 
-                # we may need to check image size and existence of image files, but it takes time, so user should check it before training
+                # Validate cache against actual files on disk
+                actual_paths = set(glob_images(subset.image_dir, "*"))
+                cached_paths = set(metas.keys())
+                added = actual_paths - cached_paths
+                removed = cached_paths - actual_paths
+                if added or removed:
+                    logger.warning(
+                        f"metadata_cache.json is stale ({len(added)} added, {len(removed)} removed). Rebuilding..."
+                    )
+                    metas = None
+                    use_cached_info_for_subset = False
+                    img_paths = sorted(actual_paths)
+                    sizes: List[Optional[Tuple[int, int]]] = [None] * len(img_paths)
+                else:
+                    img_paths = list(metas.keys())
+                    sizes: List[Optional[Tuple[int, int]]] = [meta["resolution"] for meta in metas.values()]
             else:
-                img_paths = glob_images(subset.image_dir, "*")
+                img_paths = sorted(actual_paths) if actual_paths is not None else glob_images(subset.image_dir, "*")
                 sizes: List[Optional[Tuple[int, int]]] = [None] * len(img_paths)
 
                 # new caching: get image size from cache files
@@ -2110,7 +2124,14 @@ class DreamBoothDataset(BaseDataset):
 
             if not use_cached_info_for_subset and subset.cache_info:
                 logger.info(f"cache image info for / 画像情報をキャッシュします : {info_cache_file}")
-                sizes = [self.get_image_size(img_path) for img_path in tqdm(img_paths, desc="get image size", disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0")]
+                sizes = [None] * len(img_paths)
+                def _get_size(i, path):
+                    return i, self.get_image_size(path)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+                    size_futures = [executor.submit(_get_size, i, p) for i, p in enumerate(img_paths)]
+                    for future in tqdm(concurrent.futures.as_completed(size_futures), total=len(img_paths), desc="get image size", disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0"):
+                        i, sz = future.result()
+                        sizes[i] = sz
                 matas = {}
                 for img_path, caption, size in zip(img_paths, captions, sizes):
                     matas[img_path] = {"caption": caption, "resolution": list(size)}
