@@ -542,6 +542,20 @@ function populateConfig(config) {
   $("cfg-resume").disabled = $("cfg-auto-resume").checked;
   $("cfg-network-dropout").value = n.network_dropout ?? 0;
   $("cfg-network-args").value = (n.network_args || []).join(" ");
+  // HuggingFace
+  const hfEnabled = !!t.huggingface_repo_id;
+  $("cfg-hf-enable").checked = hfEnabled;
+  $("cfg-hf-repo-id").value = t.huggingface_repo_id || "";
+  $("cfg-hf-path-in-repo").value = t.huggingface_path_in_repo || "";
+  $("cfg-hf-visibility").value = t.huggingface_repo_visibility || "private";
+  $("cfg-hf-save-state").checked = t.save_state_to_huggingface ?? false;
+  $("cfg-hf-async").checked = t.async_upload ?? true;
+  $("cfg-hf-token").value = t.huggingface_token || "";
+  const hfResumeEnabled = !!t.resume_from_huggingface;
+  $("cfg-hf-resume-enable").checked = hfResumeEnabled;
+  $("cfg-hf-resume-path").value = (hfResumeEnabled && t.resume) ? t.resume : "";
+  updateHfResumeUI(hfResumeEnabled);
+  updateHfUI(hfEnabled);
 }
 function populateDataset(dataset) {
   const g = dataset.general || {};
@@ -580,6 +594,7 @@ function populateDataset(dataset) {
     caption_tag_dropout_rate: s.caption_tag_dropout_rate ?? 0.0,
     caption_dropout_every_n_epochs: s.caption_dropout_every_n_epochs ?? 0,
     shuffle_caption: s.shuffle_caption ?? false,
+    cache_info: s.cache_info ?? true,
     is_reg: s.is_reg ?? false,
   }));
   // Edge case: if empty, force at least 1
@@ -814,6 +829,22 @@ function gatherConfig() {
       $("cfg-freeze-inserted-only-training").checked
         ? { freeze_inserted_only_training: true }
         : {}),
+      // HuggingFace upload
+      ...($("cfg-hf-enable").checked && $("cfg-hf-repo-id").value.trim() ? {
+        huggingface_repo_id: $("cfg-hf-repo-id").value.trim(),
+        huggingface_repo_type: "model",
+        huggingface_repo_visibility: $("cfg-hf-visibility").value,
+        ...($("cfg-hf-path-in-repo").value.trim() && { huggingface_path_in_repo: $("cfg-hf-path-in-repo").value.trim() }),
+        save_state_to_huggingface: $("cfg-hf-save-state").checked,
+        async_upload: $("cfg-hf-async").checked,
+        ...($("cfg-hf-token").value.trim() && { huggingface_token: $("cfg-hf-token").value.trim() }),
+      } : {}),
+      // HuggingFace resume
+      ...($("cfg-hf-resume-enable").checked && $("cfg-hf-resume-path").value.trim() ? {
+        resume_from_huggingface: true,
+        resume: $("cfg-hf-resume-path").value.trim(),
+        ...($("cfg-hf-token").value.trim() && { huggingface_token: $("cfg-hf-token").value.trim() }),
+      } : {}),
       // Diagnostics
       step_profile: $("cfg-step-profile").checked,
       profile_microbatch: $("cfg-profile-microbatch").checked,
@@ -901,6 +932,7 @@ function gatherDataset() {
                 s.caption_dropout_every_n_epochs,
               ),
               shuffle_caption: s.shuffle_caption,
+              cache_info: s.cache_info,
             };
             if (s.is_reg) subset.is_reg = true;
             if ($("cfg-alpha-mask").checked) subset.alpha_mask = true;
@@ -925,6 +957,7 @@ function addSubset(shouldRender = true) {
     caption_tag_dropout_rate: 0.0,
     caption_dropout_every_n_epochs: 0,
     shuffle_caption: false,
+    cache_info: true,
     is_reg: false,
     collapsed: false,
   });
@@ -1012,6 +1045,9 @@ function renderSubsets() {
                     <div class="form-group">
                         <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-flip-aug" ${subset.flip_aug ? "checked" : ""}> Flip Augmentations</label>
                     </div>
+                    <div class="form-group">
+                        <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-cache-info" ${subset.cache_info ? "checked" : ""}> Cache Metadata</label>
+                    </div>
                 </div>
                 <div class="form-group" style="margin-top: 10px;">
                     <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-is-reg" ${subset.is_reg ? "checked" : ""}> Regularization Dataset</label>
@@ -1048,6 +1084,7 @@ function renderSubsets() {
           ".sub-shuffle-caption",
         ).checked;
         subset.flip_aug = card.querySelector(".sub-flip-aug").checked;
+        subset.cache_info = card.querySelector(".sub-cache-info").checked;
         subset.is_reg = card.querySelector(".sub-is-reg").checked;
         checkDirty();
       };
@@ -1181,6 +1218,30 @@ $("cfg-auto-resume").addEventListener("change", (e) => {
   $("cfg-resume").disabled = e.target.checked;
   if (e.target.checked) $("cfg-resume").value = "";
 });
+
+function updateHfUI(enabled) {
+  const g = $("group-hf");
+  if (enabled) {
+    g.classList.remove("hidden");
+    g.style.display = "flex";
+  } else {
+    g.classList.add("hidden");
+    g.style.display = "none";
+  }
+}
+$("cfg-hf-enable").addEventListener("change", (e) => updateHfUI(e.target.checked));
+
+function updateHfResumeUI(enabled) {
+  const g = $("group-hf-resume");
+  if (enabled) {
+    g.classList.remove("hidden");
+    g.style.display = "flex";
+  } else {
+    g.classList.add("hidden");
+    g.style.display = "none";
+  }
+}
+$("cfg-hf-resume-enable").addEventListener("change", (e) => updateHfResumeUI(e.target.checked));
 
 // Mark dirty on any input change
 document.addEventListener("input", (e) => {

@@ -235,7 +235,7 @@
                                 <label>Mixed Precision</label>
                                 <select id="cfg-mixed-precision">
                                     <option value="bf16">BFloat16</option>
-                                    <option value="fp16">Float16</option>
+                                    <option value="fp16" hidden>Float16</option>
                                     <option value="no">Float32</option>
                                 </select>
                             </div>
@@ -520,6 +520,55 @@
                             <label>Resume State Folder</label>
                             <input type="text" id="cfg-resume" placeholder="C:\path\to\saved_state">
                             <small>Resume training state (optimizer, scheduler, step count). Leave blank when auto-resume is enabled.</small>
+                        </div>
+
+                        <h4>HuggingFace</h4>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-hf-enable"> Upload checkpoints to HuggingFace</label>
+                            <small>Automatically push saved checkpoints to a HuggingFace model repo after each save.</small>
+                        </div>
+                        <div id="group-hf" class="hidden" style="padding-left: 16px; border-left: 2px solid var(--border); margin-top: 10px; display: flex; flex-direction: column; gap: 12px;">
+                            <div class="form-group">
+                                <label>Repo ID</label>
+                                <input type="text" id="cfg-hf-repo-id" placeholder="username/model-name">
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Path in Repo</label>
+                                    <input type="text" id="cfg-hf-path-in-repo" placeholder="checkpoints/">
+                                    <small>Optional subfolder inside the repo.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Visibility</label>
+                                    <select id="cfg-hf-visibility">
+                                        <option value="private">Private</option>
+                                        <option value="public">Public</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-hf-save-state"> Include optimizer state</label>
+                                <small>Also uploads training state. Useful for resuming from HuggingFace.</small>
+                            </div>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-hf-async" checked> Async upload</label>
+                                <small>Upload in background — training continues without waiting.</small>
+                            </div>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-hf-resume-enable"> Resume from HuggingFace</label>
+                                <small>Download and resume a saved training state from a HuggingFace repo.</small>
+                            </div>
+                            <div id="group-hf-resume" class="hidden" style="padding-left: 16px; border-left: 2px solid var(--border); display: flex; flex-direction: column; gap: 8px;">
+                                <div class="form-group">
+                                    <label>Resume Path</label>
+                                    <input type="text" id="cfg-hf-resume-path" placeholder="username/repo/checkpoints/state-epoch-5">
+                                    <small>Format: <code>repo_id/path/to/state</code> or <code>repo_id/path:revision:repo_type</code></small>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>HF Token <span style="opacity:0.5">(optional — prefer HUGGING_FACE_HUB_TOKEN env var)</span></label>
+                                <input type="password" id="cfg-hf-token" placeholder="hf_...">
+                            </div>
                         </div>
                     </div>
 
