@@ -789,29 +789,16 @@ class PatchEmbed(nn.Module):
 
 
 def _run_adaln_modulation_fp32(modulation: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
-    """Run an AdaLN modulation Sequential and return the result in fp32.
+    """Run an AdaLN modulation through each submodule's forward, return fp32.
 
-    Calls each submodule through its (possibly LoRA-patched) forward, so any
-    runtime monkey-patches on nn.Linear.forward -- e.g. those installed by
-    networks/lora.py: ``self.org_module.forward = self.forward`` -- are preserved.
-    Bypassing forward with F.linear(out, module.weight.float(), ...) would
-    silently drop LoRA deltas on adaln_modulation Linears during fp16 training,
-    so we deliberately do not do that.
-
-    As a trade-off, the inner matmul still runs in the module's weight dtype
-    (typically fp16). The fp32 cast on the output buys precision for the
-    downstream + adaln_lora addition and the layer-norm scaling, matching the
-    spirit of upstream's torch.autocast(dtype=float32) attempt; it does NOT
-    prevent overflow inside the matmul itself. The caller should wrap this in
-    torch.amp.autocast(enabled=False) so an outer fp16 autocast does not
-    re-downcast the fp32 result.
+    Goes through module.forward (not F.linear with raw weights) so LoRA's
+    monkey-patched forward in networks/lora.py participates; bypassing it
+    silently drops LoRA deltas on adaln_modulation. Inner matmul still runs
+    in the module's weight dtype; only the output is promoted.
     """
     out = x
     for module in modulation:
         if isinstance(module, nn.Linear):
-            # Under autocast(enabled=False), F.linear requires input dtype to
-            # match the weight dtype; the LoRA-patched forward calls F.linear
-            # internally, so we honor the same constraint here.
             out = module(out.to(module.weight.dtype))
         else:
             out = module(out)
@@ -826,19 +813,12 @@ def _modulate_adaln(
     n_chunks: int,
     do_fp32: bool,
 ) -> Tuple[torch.Tensor, ...]:
-    """Run an AdaLN modulation, optionally promoted to fp32, and chunk the result.
+    """Run an AdaLN modulation, optionally in fp32, and chunk the result.
 
-    When do_fp32 is True, runs in fp32 under autocast(enabled=False) so an outer
-    fp16 autocast does not re-downcast the intermediate values. The caller is
-    responsible for only setting do_fp32 when an outer autocast context will
-    later downcast the chunked result back to the surrounding weight dtype --
-    otherwise fp32 shifts/scales will hit fp16 Linear weights and raise a
-    Float-vs-Half matmul error.
-
-    lora_addend, if not None, is added to the modulation output before chunking.
-    The caller is responsible for providing lora_addend in fp32 when do_fp32 is
-    True; this lets a single lora tensor be reused across several calls without
-    redundant per-call casts.
+    do_fp32=True must only be set when an outer autocast(fp16) is active to
+    downcast the chunked result back; otherwise fp32 shifts/scales would hit
+    fp16 Linear weights and crash. lora_addend, if given, must already match
+    the modulation output dtype (fp32 when do_fp32, else module's dtype).
     """
     if do_fp32:
         with torch.amp.autocast(device_type=emb.device.type, enabled=False):
@@ -905,11 +885,8 @@ class FinalLayer(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         use_fp32: bool = False,
     ):
-        # Gate the fp32 modulation path on an outer autocast: only safe when it
-        # will downcast the fp32 shift/scale back to fp16 inside self.linear
-        # below. The sampling loop (anima_train_utils.do_sample) disables
-        # autocast and runs with fp16 weights, so without the gate we'd hit a
-        # Float-vs-Half matmul error there.
+        # fp32 modulation only when an outer autocast(fp16) is active to downcast
+        # back; do_sample disables autocast and would crash without this gate.
         do_fp32 = use_fp32 and torch.is_autocast_enabled(x_B_T_H_W_D.device.type)
 
         if self.use_adaln_lora:
@@ -1037,17 +1014,12 @@ class Block(nn.Module):
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         use_fp32: bool = False,
     ) -> torch.Tensor:
-        # Gate the fp32 stability path on the outer autocast: only safe when an
-        # outer autocast(fp16) context will downcast fp32 activations back to
-        # fp16 before the fp16-weighted Linear layers in self_attn / cross_attn
-        # / mlp. The sampling loop (anima_train_utils.do_sample) disables
-        # autocast and runs the dit with fp16 weights, so without the gate we'd
-        # hit a Float-vs-Half matmul error there.
+        # fp32 promotion only when an outer autocast(fp16) is active to downcast
+        # back; do_sample disables autocast and would crash without this gate.
         do_fp32 = use_fp32 and torch.is_autocast_enabled(x_B_T_H_W_D.device.type)
 
         if do_fp32:
-            # Promote residual stream to fp32 for stability across sublayers;
-            # the enclosing autocast downcasts back to fp16 inside each one.
+            # Residual stays fp32 across sublayers; autocast downcasts inside each one.
             x_B_T_H_W_D = x_B_T_H_W_D.float()
 
         if extra_per_block_pos_emb is not None:
@@ -1055,7 +1027,6 @@ class Block(nn.Module):
 
         if self.use_adaln_lora:
             assert adaln_lora_B_T_3D is not None
-            # Cast once and reuse across the three modulation calls below.
             lora_addend = adaln_lora_B_T_3D.float() if do_fp32 else adaln_lora_B_T_3D
         else:
             lora_addend = None
@@ -1530,7 +1501,7 @@ class MiniTrainDIT(nn.Module):
                     block_kwargs["extra_per_block_pos_emb"], _sp_group, seq_dim=2
                 )
 
-        # Determine whether to use float32 for block computations based on input dtype (use float32 for better stability when input is float16)
+        # Block fp32 promotion only for fp16; bf16 has enough range without it.
         use_fp32 = x_B_T_H_W_D.dtype == torch.float16
 
         for block_idx, block in enumerate(self.blocks):
