@@ -834,14 +834,16 @@ def _modulate_adaln(
     otherwise fp32 shifts/scales will hit fp16 Linear weights and raise a
     Float-vs-Half matmul error.
 
-    lora_addend, if not None, is added to the modulation output before chunking
-    (and cast to fp32 in the do_fp32 path to match the modulation dtype).
+    lora_addend, if not None, is added to the modulation output before chunking.
+    The caller is responsible for providing lora_addend in fp32 when do_fp32 is
+    True; this lets a single lora tensor be reused across several calls without
+    redundant per-call casts.
     """
     if do_fp32:
         with torch.amp.autocast(device_type=emb.device.type, enabled=False):
             out = _run_adaln_modulation_fp32(modulation, emb)
             if lora_addend is not None:
-                out = out + lora_addend.float()
+                out = out + lora_addend
             return out.chunk(n_chunks, dim=-1)
     out = modulation(emb)
     if lora_addend is not None:
@@ -912,6 +914,8 @@ class FinalLayer(nn.Module):
         if self.use_adaln_lora:
             assert adaln_lora_B_T_3D is not None
             lora_addend = adaln_lora_B_T_3D[:, :, : 2 * self.hidden_size]
+            if do_fp32:
+                lora_addend = lora_addend.float()
         else:
             lora_addend = None
 
@@ -1050,7 +1054,8 @@ class Block(nn.Module):
 
         if self.use_adaln_lora:
             assert adaln_lora_B_T_3D is not None
-            lora_addend = adaln_lora_B_T_3D
+            # Cast once and reuse across the three modulation calls below.
+            lora_addend = adaln_lora_B_T_3D.float() if do_fp32 else adaln_lora_B_T_3D
         else:
             lora_addend = None
 
