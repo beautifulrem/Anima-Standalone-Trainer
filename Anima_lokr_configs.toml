@@ -1,4 +1,5 @@
 # Anima LoKr Training Configuration
+# Mirrors Anima_lora_configs.toml; only [network_arguments] is LoKr-specific.
 
 [model_arguments]
 dit_path = "/path/to/anima-preview.safetensors"
@@ -32,7 +33,7 @@ max_data_loader_n_workers = 4
 persistent_data_loader_workers = true
 seed = 42022
 
-[anima_arguments]
+#[anima_arguments]
 timestep_sample_method = "logit_normal"
 discrete_flow_shift = 3.0
 
@@ -46,18 +47,50 @@ network_dim = 16
 network_alpha = 16
 network_train_unet_only = true
 
-# LoKr-specific kwargs (free-form key=value strings; see networks/lokr.py:create_network):
-#   factor=N                    Kronecker factor; -1 = auto factorize for balance (default -1)
-#   use_tucker=true|false       Tucker decomposition for Conv2d 3x3+ (default false)
-#   conv_dim=N                  rank for Conv2d 3x3 layers (default off)
-#   conv_alpha=N                alpha for Conv2d 3x3 layers
-#   rank_dropout=0.1            drop ranks during forward
-#   module_dropout=0.1          drop whole modules during forward
-#   train_llm_adapter=True      include LLMAdapterTransformerBlock targets
-#   self_attn_dim=N             per-type dim override (also cross_attn_dim, mlp_dim, mod_dim, llm_adapter_dim)
-#   emb_dims=4,4,4              ranks for x_embedder, t_embedder, final_layer (single comma-separated string)
-#   train_block_indices=0-15    selective per-block training ("all", "none", "0,2,5-7")
-network_args = [ "factor=-1", "use_tucker=false" ]
+# network_args — free-form "key=value" strings passed to networks.lokr.create_network.
+# The Web UI's "Network Args" textbox accepts the same set, space-separated.
+# Every kwarg below is optional; omit for the listed default.
+#
+# LoKr-specific
+#   factor=N                   Kronecker factor. -1 (default) auto-factorizes for balance;
+#                              positive N gives one w shape of (N, ...) and lets the other
+#                              dim float. Larger factor = more compression of w2.
+#                              For very large layers (e.g. 8192 MLP), factor=8 or 16 is typical.
+#   use_tucker=true|false      Tucker-decompose Conv2d 3x3 (default false)
+#
+# Regularization
+#   rank_dropout=0.1           drop ranks each forward, 0..1 (default off)
+#   module_dropout=0.1         drop whole modules each forward, 0..1 (default off)
+#
+# Conv2d 3x3 targeting (off by default — Anima DiT is all Linear)
+#   conv_dim=N                 rank for Conv2d 3x3 layers
+#   conv_alpha=N               alpha for Conv2d 3x3 (defaults to 1.0 when conv_dim set)
+#
+# Anima per-type rank overrides (None = use network_dim, 0 = exclude that family)
+#   self_attn_dim=N            rank for self_attn Linears
+#   cross_attn_dim=N           rank for cross_attn Linears
+#   mlp_dim=N                  rank for MLP layers
+#   mod_dim=N                  rank for adaln_modulation_* (excluded by default; set to opt in)
+#   llm_adapter_dim=N          rank for LLMAdapterTransformerBlock (also requires train_llm_adapter=true)
+#   train_llm_adapter=true     include the LLM adapter targets (default false)
+#   emb_dims=4,4,4             ranks for [x_embedder, t_embedder, final_layer] (single string, 3 ints)
+#   train_block_indices=0-7    selective per-block training: "all" / "none" / "0,2,5-7"
+#
+# Regex overrides on module dotted name (e.g. blocks.0.self_attn.q_proj)
+#   network_reg_dims="blocks\\.0\\..*=32,blocks\\.\\d+\\.mlp.*=8"
+#   network_reg_lrs="blocks\\.0\\..*=1e-4"
+#
+# LoRA+ split learning rate
+#   loraplus_lr_ratio=16                          unified up/down ratio, or split:
+#   loraplus_unet_lr_ratio=16
+#   loraplus_text_encoder_lr_ratio=16
+#
+# Suggested presets (uncomment one):
+#   network_args = [ "factor=-1" ]                                  # auto-factor (balanced kron split)
+#   network_args = [ "factor=8" ]                                   # fixed factor — more compression on big layers
+#   network_args = [ "factor=-1", "mod_dim=4" ]                     # auto-factor + AdaLN modulation
+#   network_args = [ "factor=-1", "rank_dropout=0.1" ]              # auto-factor + rank dropout
+network_args = [ "factor=-1" ]
 
 # To initialize from a LoKr checkpoint (start new training with these weights):
 # network_weights = "/path/to/lokr.safetensors"
