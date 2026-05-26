@@ -55,7 +55,13 @@ def main(args):
             original_module_name = original_module_name.replace(".linear.", ".linear_")
             original_module_name = original_module_name.replace("t.embedding.norm", "t_embedding_norm")
             original_module_name = original_module_name.replace("x.embedder", "x_embedder")
-            original_module_name = original_module_name.replace("adaln.modulation.cross_attn", "adaln_modulation_cross_attn")
+            # All underscores already became dots, so LHS must use dots too —
+            # the upstream LHS "cross_attn" never matched and silently produced
+            # "adaln_modulation.cross_attn" (split path) instead of the real
+            # Block attribute "adaln_modulation_cross_attn" (single attribute).
+            # Same for self_attn (which upstream forgot entirely).
+            original_module_name = original_module_name.replace("adaln.modulation.cross.attn", "adaln_modulation_cross_attn")
+            original_module_name = original_module_name.replace("adaln.modulation.self.attn", "adaln_modulation_self_attn")
             original_module_name = original_module_name.replace("adaln.modulation.mlp", "adaln_modulation_mlp")
             original_module_name = original_module_name.replace("cross.attn", "cross_attn")
             original_module_name = original_module_name.replace("k.proj", "k_proj")
