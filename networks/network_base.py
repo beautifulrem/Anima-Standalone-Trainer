@@ -150,6 +150,21 @@ def _is_tp_active(unet) -> bool:
 
 _MAX_KV_PAIR_STR_LEN = 16384  # cap user-supplied --network_args string size
 
+def _precompile_regex_kv(d: Optional[Dict[str, Any]]) -> Optional[List[Tuple[re.Pattern, Any, str]]]:
+    """Compile each key of a {regex_str: value} dict to a 3-tuple
+    (compiled_pattern, value, original_str). Bad patterns are dropped with
+    a warning so construction doesn't fail in the per-module hot loop."""
+    if d is None:
+        return None
+    compiled = []
+    for k, v in d.items():
+        try:
+            compiled.append((re.compile(k), v, k))
+        except re.error as e:
+            logger.warning(f"Invalid regex '{k}' in reg_dims/reg_lrs, skipping: {e}")
+    return compiled
+
+
 def _parse_kv_pairs(kv_pair_str: str, is_int: bool) -> Dict[str, Union[int, float]]:
     """Parse a string of key-value pairs separated by commas."""
     if not isinstance(kv_pair_str, str):
@@ -181,6 +196,14 @@ def _parse_common_create_network_kwargs(kwargs: Dict, arch_config: ArchConfig) -
     --network_args. Returns a dict the caller forwards into AdditionalNetwork.
     Hoisted out of each create_network to avoid ~50 lines of duplicated parsing.
     """
+    def _opt_cast(name, ctor):
+        v = kwargs.get(name, None)
+        return ctor(v) if v is not None else None
+
+    def _opt_kv(name, is_int):
+        raw = kwargs.get(name, None)
+        return _parse_kv_pairs(raw, is_int=is_int) if raw is not None else None
+
     def _opt_list(name):
         raw = kwargs.get(name, None)
         if raw is None:
@@ -201,36 +224,24 @@ def _parse_common_create_network_kwargs(kwargs: Dict, arch_config: ArchConfig) -
     exclude_patterns = _opt_list("exclude_patterns") or []
     exclude_patterns.extend(arch_config.default_excludes)
 
-    include_patterns = _opt_list("include_patterns")
-
-    rank_dropout = kwargs.get("rank_dropout", None)
-    if rank_dropout is not None:
-        rank_dropout = float(rank_dropout)
-    module_dropout = kwargs.get("module_dropout", None)
-    if module_dropout is not None:
-        module_dropout = float(module_dropout)
-
-    conv_lora_dim = kwargs.get("conv_dim", None)
-    conv_alpha = kwargs.get("conv_alpha", None)
-    if conv_lora_dim is not None:
-        conv_lora_dim = int(conv_lora_dim)
-        conv_alpha = float(conv_alpha) if conv_alpha is not None else 1.0
-
-    reg_lrs_raw = kwargs.get("network_reg_lrs", None)
-    reg_dims_raw = kwargs.get("network_reg_dims", None)
+    conv_lora_dim = _opt_cast("conv_dim", int)
+    conv_alpha = _opt_cast("conv_alpha", float)
+    # conv_alpha defaults to 1.0 only when conv_dim is set and conv_alpha was not.
+    if conv_lora_dim is not None and conv_alpha is None:
+        conv_alpha = 1.0
 
     return {
         "train_llm_adapter": _str_to_bool(kwargs.get("train_llm_adapter", False)),
         "exclude_patterns": exclude_patterns,
-        "include_patterns": include_patterns,
-        "rank_dropout": rank_dropout,
-        "module_dropout": module_dropout,
+        "include_patterns": _opt_list("include_patterns"),
+        "rank_dropout": _opt_cast("rank_dropout", float),
+        "module_dropout": _opt_cast("module_dropout", float),
         "conv_lora_dim": conv_lora_dim,
         "conv_alpha": conv_alpha,
         "use_tucker": _str_to_bool(kwargs.get("use_tucker", False)),
         "verbose": _str_to_bool(kwargs.get("verbose", False)),
-        "reg_lrs": _parse_kv_pairs(reg_lrs_raw, is_int=False) if reg_lrs_raw is not None else None,
-        "reg_dims": _parse_kv_pairs(reg_dims_raw, is_int=True) if reg_dims_raw is not None else None,
+        "reg_lrs": _opt_kv("network_reg_lrs", is_int=False),
+        "reg_dims": _opt_kv("network_reg_dims", is_int=True),
     }
 
 
@@ -298,23 +309,10 @@ class AdditionalNetwork(torch.nn.Module):
         self.train_llm_adapter = train_llm_adapter
         self.reg_dims = reg_dims
         self.reg_lrs = reg_lrs
-        # Pre-compile reg_dims/reg_lrs regex patterns once. The original code
-        # called `re.fullmatch(str_pattern, ...)` inside the per-module hot loop,
-        # which leaned on Python's 512-entry compile cache and churned for any
-        # non-trivial reg_* set. Invalid patterns are dropped here with a warning
-        # instead of failing mid-loop.
-        def _precompile_kv(d):
-            if d is None:
-                return None
-            compiled = []
-            for k, v in d.items():
-                try:
-                    compiled.append((re.compile(k), v, k))
-                except re.error as e:
-                    logger.warning(f"Invalid regex '{k}' in reg_dims/reg_lrs, skipping: {e}")
-            return compiled
-        self._reg_dims_compiled = _precompile_kv(reg_dims)
-        self._reg_lrs_compiled = _precompile_kv(reg_lrs)
+        # Compile once instead of inside the per-module hot loop. Bad patterns
+        # are dropped at compile time so a typo doesn't kill construction.
+        self._reg_dims_compiled = _precompile_regex_kv(reg_dims)
+        self._reg_lrs_compiled = _precompile_regex_kv(reg_lrs)
         self.arch_config = arch_config
         self.type_dims = type_dims
         self.emb_dims = emb_dims
