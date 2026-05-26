@@ -47,11 +47,29 @@ network_alpha = 16
 network_train_unet_only = true
 
 # network_args: free-form "key=value" strings for networks.lokr.create_network.
-# The Web UI exposes Factor, Mod Dim, Rank Dropout, Module Dropout, and Use Tucker
-# as dedicated fields; every other kwarg only goes here or in the UI's free-form
-# Network Args textbox. Full reference: networks/lokr.py:create_network.
-# `factor=-1` auto-factorizes for balance (recommended); set a positive int (e.g. 8 or
-# 16) to compress large layers more aggressively.
+#
+# Surfaced as dedicated UI fields (also settable here):
+#   factor=N                        Kronecker factor. -1 (default) auto-factorizes for balance;
+#                                   set a positive int (e.g. 8 or 16) to compress large layers more aggressively.
+#   mod_dim=N                       rank for adaln_modulation_* (excluded by default; set to opt in)
+#   rank_dropout=N                  drop ranks each forward, 0..1 (default off)
+#   module_dropout=N                drop whole modules each forward, 0..1 (default off)
+#   use_tucker=true|false           Tucker-decompose Conv2d 3x3 (default false; Anima DiT is all Linear)
+#
+# TOML-only (or the UI's free-form Network Args textbox):
+#   conv_dim=N, conv_alpha=N        Conv2d 3x3 targeting (off by default)
+#   self_attn_dim=N, cross_attn_dim=N, mlp_dim=N, llm_adapter_dim=N
+#                                   per-type rank overrides (omit = network_dim; 0 = exclude that family)
+#   train_llm_adapter=true          include LLMAdapterTransformerBlock targets (default false)
+#   emb_dims=4,4,4                  ranks for [x_embedder, t_embedder, final_layer]
+#   train_block_indices=0-7         selective per-block training: "all" / "none" / "0,2,5-7"
+#   network_reg_dims="pat=N,..."    regex on dotted module name → per-pattern dim override
+#   network_reg_lrs="pat=lr,..."    regex on dotted module name → per-pattern LR
+#   loraplus_lr_ratio=N             LoRA+ unified up/down ratio
+#   loraplus_unet_lr_ratio=N        ...or split per side:
+#   loraplus_text_encoder_lr_ratio=N
+#
+# Full reference: networks/lokr.py:create_network
 network_args = [ "factor=-1", "mod_dim=4" ]
 
 # To initialize from a LoKr checkpoint:
