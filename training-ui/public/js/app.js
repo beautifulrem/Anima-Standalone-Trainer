@@ -526,7 +526,8 @@ function populateConfig(config) {
   $("cfg-resume").value = n.resume || "";
   $("cfg-resume").disabled = $("cfg-auto-resume").checked;
   $("cfg-network-dropout").value = n.network_dropout ?? 0;
-  $("cfg-network-args").value = (n.network_args || []).join(" ");
+  loadNetworkArgs(n.network_args || []);
+  updateLycorisExtrasUI($("cfg-network-module").value);
 }
 function populateDataset(dataset) {
   const g = dataset.general || {};
@@ -803,9 +804,10 @@ function gatherConfig() {
           ...(safeFloat($("cfg-network-dropout").value) > 0 && {
             network_dropout: safeFloat($("cfg-network-dropout").value),
           }),
-          ...($("cfg-network-args").value.trim() && {
-            network_args: $("cfg-network-args").value.trim().split(/\s+/),
-          }),
+          ...(() => {
+            const args = gatherNetworkArgs();
+            return args.length > 0 ? { network_args: args } : {};
+          })(),
           ...($("cfg-network-weights").value && {
             network_weights: $("cfg-network-weights").value,
           }),
@@ -1133,8 +1135,122 @@ function updateTrainingTypeUI(type) {
 }
 $("cfg-training-type").addEventListener("change", (e) => {
   updateTrainingTypeUI(e.target.value);
+  updateLycorisExtrasUI($("cfg-network-module").value);
   checkDirty();
 });
+
+// Show/hide LoHa/LoKr dedicated fields based on network module.
+// Factor sub-wrapper is only relevant for LoKr; everything else is shared.
+function updateLycorisExtrasUI(networkModule) {
+  const isLoha = networkModule === "networks.loha";
+  const isLokr = networkModule === "networks.lokr";
+  $("lycoris-extras-section").classList.toggle("hidden", !(isLoha || isLokr));
+  $("lokr-only-fields").classList.toggle("hidden", !isLokr);
+}
+$("cfg-network-module").addEventListener("change", (e) => {
+  redistributeForModuleChange();
+  updateLycorisExtrasUI(e.target.value);
+  checkDirty();
+});
+
+// On module change, repartition everything currently in dedicated fields + freeform
+// against the NEW module's active set. Dedicated tokens win dedup on key collision
+// (their first-position in the collected list shadows the freeform copy).
+function redistributeForModuleChange() {
+  const tokens = [];
+  const f = $("cfg-lokr-factor").value.trim(); if (f) tokens.push(`factor=${f}`);
+  const m = $("cfg-mod-dim").value.trim(); if (m) tokens.push(`mod_dim=${m}`);
+  const r = $("cfg-rank-dropout").value.trim(); if (r) tokens.push(`rank_dropout=${r}`);
+  const d = $("cfg-module-dropout").value.trim(); if (d) tokens.push(`module_dropout=${d}`);
+  if ($("cfg-use-tucker").checked) tokens.push("use_tucker=true");
+  const free = $("cfg-network-args").value.trim();
+  if (free) tokens.push(...free.split(/\s+/));
+  const seen = new Set();
+  const merged = tokens.filter((t) => {
+    const eq = t.indexOf("=");
+    const k = eq >= 0 ? t.slice(0, eq) : t;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  loadNetworkArgs(merged);
+}
+
+// Keys handled by the LoHa/LoKr dedicated UI fields. Same set drives save and load:
+// dedicated values override matching keys in the freeform Network Args text box.
+const LYCORIS_DEDICATED_KEYS = ["factor", "mod_dim", "rank_dropout", "module_dropout", "use_tucker"];
+
+// Which dedicated keys are "active" for a given network_module. LoKr accepts the
+// full set including factor; LoHa accepts everything except factor; other modules
+// treat dedicated fields as inactive (their values aren't emitted, freeform pass-through).
+function activeDedicatedKeys(networkModule) {
+  if (networkModule === "networks.lokr") return LYCORIS_DEDICATED_KEYS;
+  if (networkModule === "networks.loha") return LYCORIS_DEDICATED_KEYS.filter((k) => k !== "factor");
+  return [];
+}
+
+// Build the `network_args` array emitted into the per-job TOML. Dedicated fields
+// take precedence over the freeform text box on key collision (the freeform copy
+// is dropped).
+function gatherNetworkArgs() {
+  const active = activeDedicatedKeys($("cfg-network-module").value);
+  const dedicated = [];
+  if (active.includes("factor")) {
+    const v = $("cfg-lokr-factor").value.trim();
+    if (v !== "") dedicated.push(`factor=${v}`);
+  }
+  if (active.includes("mod_dim")) {
+    const v = $("cfg-mod-dim").value.trim();
+    if (v !== "") dedicated.push(`mod_dim=${v}`);
+  }
+  if (active.includes("rank_dropout")) {
+    const v = $("cfg-rank-dropout").value.trim();
+    if (v !== "") dedicated.push(`rank_dropout=${v}`);
+  }
+  if (active.includes("module_dropout")) {
+    const v = $("cfg-module-dropout").value.trim();
+    if (v !== "") dedicated.push(`module_dropout=${v}`);
+  }
+  if (active.includes("use_tucker") && $("cfg-use-tucker").checked) {
+    dedicated.push("use_tucker=true");
+  }
+  const freeformRaw = $("cfg-network-args").value.trim();
+  const freeform = freeformRaw
+    ? freeformRaw.split(/\s+/).filter((tok) => {
+        const eq = tok.indexOf("=");
+        const key = eq >= 0 ? tok.slice(0, eq) : tok;
+        return !active.includes(key);
+      })
+    : [];
+  return [...dedicated, ...freeform];
+}
+
+// Split a loaded `network_args` array into dedicated form fields + freeform text box.
+// Inverse of gatherNetworkArgs. Keys not active for the current module stay in freeform
+// (e.g. an old LoKr-saved `factor=8` loaded into LoHa goes into the freeform box).
+function loadNetworkArgs(args) {
+  const active = activeDedicatedKeys($("cfg-network-module").value);
+  const dedicated = {};
+  const freeform = [];
+  for (const tok of args) {
+    const eq = tok.indexOf("=");
+    if (eq < 0) {
+      freeform.push(tok);
+      continue;
+    }
+    const key = tok.slice(0, eq);
+    const val = tok.slice(eq + 1);
+    if (active.includes(key)) dedicated[key] = val;
+    else freeform.push(tok);
+  }
+  $("cfg-lokr-factor").value = dedicated.factor ?? "";
+  $("cfg-mod-dim").value = dedicated.mod_dim ?? "";
+  $("cfg-rank-dropout").value = dedicated.rank_dropout ?? "";
+  $("cfg-module-dropout").value = dedicated.module_dropout ?? "";
+  const tucker = (dedicated.use_tucker || "").toLowerCase();
+  $("cfg-use-tucker").checked = ["true", "1", "yes", "y"].includes(tucker);
+  $("cfg-network-args").value = freeform.join(" ");
+}
 
 // Disable manual resume path when auto-resume is enabled
 $("cfg-auto-resume").addEventListener("change", (e) => {
