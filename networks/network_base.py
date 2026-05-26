@@ -273,18 +273,16 @@ class AdditionalNetwork(torch.nn.Module):
                             original_name = (name + "." if name else "") + child_name
                             lora_name = f"{prefix}.{original_name}".replace(".", "_")
 
+                            # `filter` is a positive selector for the emb_dims second-pass;
+                            # if set and not matched, skip immediately. A matched filter
+                            # is also an explicit user request → bypass default_excludes.
                             force_incl_conv2d = False
+                            explicit_include = False
                             if filter is not None:
                                 if filter not in lora_name:
                                     continue
                                 force_incl_conv2d = include_conv2d_if_filter
-
-                            excluded = any(pattern.fullmatch(original_name) for pattern in exclude_re_patterns)
-                            included = any(pattern.fullmatch(original_name) for pattern in include_re_patterns)
-                            if excluded and not included:
-                                if verbose:
-                                    logger.info(f"exclude: {original_name}")
-                                continue
+                                explicit_include = True
 
                             dim = None
                             alpha_val = None
@@ -293,6 +291,7 @@ class AdditionalNetwork(torch.nn.Module):
                                 if lora_name in modules_dim:
                                     dim = modules_dim[lora_name]
                                     alpha_val = modules_alpha[lora_name]
+                                    explicit_include = True  # loading a saved module
                             else:
                                 if self.reg_dims is not None:
                                     for reg, d in self.reg_dims.items():
@@ -300,6 +299,7 @@ class AdditionalNetwork(torch.nn.Module):
                                             dim = d
                                             alpha_val = self.alpha
                                             logger.info(f"Module {original_name} matched with regex '{reg}' -> dim: {dim}")
+                                            explicit_include = True  # reg_dims is explicit
                                             break
                                 if dim is None:
                                     if is_linear or is_conv2d_1x1 or force_incl_conv2d:
@@ -309,8 +309,9 @@ class AdditionalNetwork(torch.nn.Module):
                                         dim = self.conv_lora_dim
                                         alpha_val = self.conv_alpha
 
-                                # Anima per-type dim dispatch (mirrors lora_anima.py:797-825)
-                                if is_unet and self.type_dims is not None and dim:
+                                # Anima per-type dim dispatch (mirrors lora_anima.py:797-825).
+                                # An explicit non-None type_dims entry overrides default_excludes.
+                                if is_unet and self.type_dims is not None and dim is not None:
                                     identifier_order = [
                                         (4, ("llm_adapter",)),
                                         (3, ("adaln_modulation",)),
@@ -322,6 +323,7 @@ class AdditionalNetwork(torch.nn.Module):
                                         d = self.type_dims[idx]
                                         if d is not None and all(id_str in lora_name for id_str in ids):
                                             dim = d
+                                            explicit_include = True
                                             break
 
                                 # Anima block-index gating (mirrors lora_anima.py:814-825)
@@ -336,6 +338,18 @@ class AdditionalNetwork(torch.nn.Module):
                                             except (ValueError, IndexError):
                                                 pass
                                             break
+
+                            # Apply exclude/include patterns AFTER dim determination so
+                            # that explicit user knobs (filter, type_dims, reg_dims,
+                            # modules_dim) can override default_excludes. User-supplied
+                            # include_patterns also override exclude_patterns.
+                            if not explicit_include:
+                                excluded = any(p.fullmatch(original_name) for p in exclude_re_patterns)
+                                included = any(p.fullmatch(original_name) for p in include_re_patterns)
+                                if excluded and not included:
+                                    if verbose:
+                                        logger.info(f"exclude: {original_name}")
+                                    continue
 
                             if dim is None or dim == 0:
                                 if is_linear or is_conv2d_1x1:
