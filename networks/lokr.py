@@ -310,8 +310,10 @@ class LoKrInfModule(LoKrModule):
         self.network = network
 
     def merge_to(self, sd, dtype, device):
-        # extract weight from org_module
-        org_sd = self.org_module.state_dict()
+        # Use org_module_ref so merge_to survives a prior apply_to() that
+        # `del`'d self.org_module — order [apply_to → merge_to] used to crash.
+        org_module = self.org_module_ref[0]
+        org_sd = org_module.state_dict()
         weight = org_sd["weight"]
         org_dtype = weight.dtype
         org_device = weight.device
@@ -322,13 +324,11 @@ class LoKrInfModule(LoKrModule):
         if device is None:
             device = org_device
 
-        # get LoKr weights
         w1 = sd["lokr_w1"].to(torch.float).to(device)
 
         if "lokr_w2" in sd:
             w2 = sd["lokr_w2"].to(torch.float).to(device)
         elif "lokr_t2" in sd:
-            # Tucker mode
             t2 = sd["lokr_t2"].to(torch.float).to(device)
             w2a = sd["lokr_w2_a"].to(torch.float).to(device)
             w2b = sd["lokr_w2_b"].to(torch.float).to(device)
@@ -338,17 +338,14 @@ class LoKrInfModule(LoKrModule):
             w2b = sd["lokr_w2_b"].to(torch.float).to(device)
             w2 = w2a @ w2b
 
-        # compute ΔW via Kronecker product
         diff_weight = make_kron(w1, w2, self.scale)
-
-        # reshape diff_weight to match original weight shape if needed
         if diff_weight.shape != weight.shape:
             diff_weight = diff_weight.reshape(weight.shape)
 
         weight = weight.to(device) + self.multiplier * diff_weight
 
         org_sd["weight"] = weight.to(dtype)
-        self.org_module.load_state_dict(org_sd)
+        org_module.load_state_dict(org_sd)
 
     def get_weight(self, multiplier=None):
         if multiplier is None:
@@ -550,7 +547,7 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
             modules_alpha[lora_name] = value
         elif "lokr_w2_a" in key:
             # low-rank mode: dim detection depends on Tucker vs non-Tucker
-            if "lokr_t2" in key.replace("lokr_w2_a", "lokr_t2") and lora_name + ".lokr_t2" in weights_sd:
+            if lora_name + ".lokr_t2" in weights_sd:
                 # Tucker: w2_a = (rank, out_k) → dim = w2_a.shape[0]
                 dim = value.shape[0]
             else:

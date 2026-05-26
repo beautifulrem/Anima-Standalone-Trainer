@@ -32,7 +32,7 @@ max_data_loader_n_workers = 4
 persistent_data_loader_workers = true
 seed = 42022
 
-#[anima_arguments]
+[anima_arguments]
 timestep_sample_method = "logit_normal"
 discrete_flow_shift = 3.0
 
@@ -60,7 +60,7 @@ network_train_unet_only = true
 network_args = [ "factor=-1", "use_tucker=false" ]
 
 # To initialize from a LoKr checkpoint (start new training with these weights):
-# network_weights = "path\\to\\lokr.safetensors"
+# network_weights = "/path/to/lokr.safetensors"
 
 # To resume training state (start from a saved state folder):
-# resume = "path\\to\\saved_state_folder"
+# resume = "/path/to/saved_state_folder"

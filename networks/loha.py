@@ -320,8 +320,10 @@ class LoHaInfModule(LoHaModule):
         self.network = network
 
     def merge_to(self, sd, dtype, device):
-        # extract weight from org_module
-        org_sd = self.org_module.state_dict()
+        # Use org_module_ref so merge_to still works after apply_to() has
+        # `del`'d self.org_module — order [apply_to → merge_to] used to crash.
+        org_module = self.org_module_ref[0]
+        org_sd = org_module.state_dict()
         weight = org_sd["weight"]
         org_dtype = weight.dtype
         org_device = weight.device
@@ -332,14 +334,12 @@ class LoHaInfModule(LoHaModule):
         if device is None:
             device = org_device
 
-        # get LoHa weights
         w1a = sd["hada_w1_a"].to(torch.float).to(device)
         w1b = sd["hada_w1_b"].to(torch.float).to(device)
         w2a = sd["hada_w2_a"].to(torch.float).to(device)
         w2b = sd["hada_w2_b"].to(torch.float).to(device)
 
         if self.tucker:
-            # Tucker mode
             t1 = sd["hada_t1"].to(torch.float).to(device)
             t2 = sd["hada_t2"].to(torch.float).to(device)
             rebuild1 = torch.einsum("i j ..., j r, i p -> p r ...", t1, w1b, w1a)
@@ -347,14 +347,13 @@ class LoHaInfModule(LoHaModule):
             diff_weight = rebuild1 * rebuild2 * self.scale
         else:
             diff_weight = ((w1a @ w1b) * (w2a @ w2b)) * self.scale
-            # reshape diff_weight to match original weight shape if needed
             if diff_weight.shape != weight.shape:
                 diff_weight = diff_weight.reshape(weight.shape)
 
         weight = weight.to(device) + self.multiplier * diff_weight
 
         org_sd["weight"] = weight.to(dtype)
-        self.org_module.load_state_dict(org_sd)
+        org_module.load_state_dict(org_sd)
 
     def get_weight(self, multiplier=None):
         if multiplier is None:

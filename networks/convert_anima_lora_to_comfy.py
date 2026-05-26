@@ -34,6 +34,11 @@ def main(args):
             is_dit_lora = k.startswith("lora_unet_")
             module_and_weight_name = "_".join(k.split("_")[2:])  # Remove `lora_unet_`or `lora_te_` prefix
 
+            if "." not in module_and_weight_name:
+                logger.warning(f"Skipping malformed key (no separator dot): {k}")
+                state_dict.pop(k)
+                continue
+
             # Split at the first dot, e.g., "block1_linear.weight" -> "block1_linear", "weight"
             module_name, weight_name = module_and_weight_name.split(".", 1)
 
@@ -100,6 +105,7 @@ def main(args):
                 module_and_weight_name = k[len(COMFYUI_QWEN3_PREFIX) :]
             else:
                 logger.warning(f"Skipping unrecognized key {k}")
+                state_dict.pop(k)
                 continue
 
             # Get weight name. Dispatch on the family-specific separator so the
