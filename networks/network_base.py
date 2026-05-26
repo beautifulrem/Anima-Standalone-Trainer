@@ -148,8 +148,16 @@ def _is_tp_active(unet) -> bool:
     return False
 
 
+_MAX_KV_PAIR_STR_LEN = 16384  # cap user-supplied --network_args string size
+
 def _parse_kv_pairs(kv_pair_str: str, is_int: bool) -> Dict[str, Union[int, float]]:
     """Parse a string of key-value pairs separated by commas."""
+    if not isinstance(kv_pair_str, str):
+        logger.warning(f"Expected str for kv_pair input, got {type(kv_pair_str).__name__}; ignoring")
+        return {}
+    if len(kv_pair_str) > _MAX_KV_PAIR_STR_LEN:
+        logger.warning(f"kv_pair input length {len(kv_pair_str)} exceeds cap {_MAX_KV_PAIR_STR_LEN}; truncating")
+        kv_pair_str = kv_pair_str[:_MAX_KV_PAIR_STR_LEN]
     pairs = {}
     for pair in kv_pair_str.split(","):
         pair = pair.strip()
@@ -177,7 +185,17 @@ def _parse_common_create_network_kwargs(kwargs: Dict, arch_config: ArchConfig) -
         raw = kwargs.get(name, None)
         if raw is None:
             return None
-        parsed = ast.literal_eval(raw)
+        # Already a list (programmatic caller bypassing CLI parsing) — keep as-is.
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, str) and len(raw) > _MAX_KV_PAIR_STR_LEN:
+            logger.warning(f"{name} length {len(raw)} exceeds cap {_MAX_KV_PAIR_STR_LEN}; ignoring")
+            return None
+        try:
+            parsed = ast.literal_eval(raw)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError) as e:
+            logger.warning(f"Could not parse {name}={raw!r} as a Python literal ({e}); ignoring")
+            return None
         return parsed if isinstance(parsed, list) else [parsed]
 
     exclude_patterns = _opt_list("exclude_patterns") or []
@@ -280,6 +298,23 @@ class AdditionalNetwork(torch.nn.Module):
         self.train_llm_adapter = train_llm_adapter
         self.reg_dims = reg_dims
         self.reg_lrs = reg_lrs
+        # Pre-compile reg_dims/reg_lrs regex patterns once. The original code
+        # called `re.fullmatch(str_pattern, ...)` inside the per-module hot loop,
+        # which leaned on Python's 512-entry compile cache and churned for any
+        # non-trivial reg_* set. Invalid patterns are dropped here with a warning
+        # instead of failing mid-loop.
+        def _precompile_kv(d):
+            if d is None:
+                return None
+            compiled = []
+            for k, v in d.items():
+                try:
+                    compiled.append((re.compile(k), v, k))
+                except re.error as e:
+                    logger.warning(f"Invalid regex '{k}' in reg_dims/reg_lrs, skipping: {e}")
+            return compiled
+        self._reg_dims_compiled = _precompile_kv(reg_dims)
+        self._reg_lrs_compiled = _precompile_kv(reg_lrs)
         self.arch_config = arch_config
         self.type_dims = type_dims
         self.emb_dims = emb_dims
@@ -360,12 +395,12 @@ class AdditionalNetwork(torch.nn.Module):
                                     alpha_val = modules_alpha[lora_name]
                                     explicit_include = True  # loading a saved module
                             else:
-                                if self.reg_dims is not None:
-                                    for reg, d in self.reg_dims.items():
-                                        if re.fullmatch(reg, original_name):
+                                if self._reg_dims_compiled is not None:
+                                    for compiled_re, d, reg_str in self._reg_dims_compiled:
+                                        if compiled_re.fullmatch(original_name):
                                             dim = d
                                             alpha_val = self.alpha
-                                            logger.info(f"Module {original_name} matched with regex '{reg}' -> dim: {dim}")
+                                            logger.info(f"Module {original_name} matched with regex '{reg_str}' -> dim: {dim}")
                                             explicit_include = True  # reg_dims is explicit
                                             break
                                 if dim is None:
@@ -590,12 +625,12 @@ class AdditionalNetwork(torch.nn.Module):
         def assemble_params(loras, lr, loraplus_ratio):
             param_groups = {"lora": {}, "plus": {}}
             reg_groups = {}
-            reg_lrs_list = list(self.reg_lrs.items()) if self.reg_lrs is not None else []
+            reg_lrs_list = self._reg_lrs_compiled if self._reg_lrs_compiled is not None else []
 
             for lora in loras:
                 matched_reg_lr = None
-                for i, (regex_str, reg_lr) in enumerate(reg_lrs_list):
-                    if re.fullmatch(regex_str, lora.original_name):
+                for i, (compiled_re, reg_lr, regex_str) in enumerate(reg_lrs_list):
+                    if compiled_re.fullmatch(lora.original_name):
                         matched_reg_lr = (i, reg_lr)
                         logger.info(f"Module {lora.original_name} matched regex '{regex_str}' -> LR {reg_lr}")
                         break
