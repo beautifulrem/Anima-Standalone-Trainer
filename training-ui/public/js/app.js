@@ -526,6 +526,9 @@ function populateConfig(config) {
   $("cfg-resume").value = n.resume || "";
   $("cfg-resume").disabled = $("cfg-auto-resume").checked;
   $("cfg-network-dropout").value = n.network_dropout ?? 0;
+  // Fresh-load path: partition the saved network_args directly against the
+  // current module's active set. (The dropdown-change handler instead calls
+  // redistributeForModuleChange to preserve user-edited state across modes.)
   loadNetworkArgs(n.network_args || []);
   updateLycorisExtrasUI($("cfg-network-module").value);
 }
@@ -1139,6 +1142,11 @@ $("cfg-training-type").addEventListener("change", (e) => {
   checkDirty();
 });
 
+// Keys handled by the LoHa/LoKr dedicated UI fields. Same set drives save, load,
+// and module-switch redistribution: dedicated values override matching keys in
+// the freeform Network Args text box.
+const LYCORIS_DEDICATED_KEYS = ["factor", "mod_dim", "rank_dropout", "module_dropout", "use_tucker"];
+
 // Show/hide LoHa/LoKr dedicated fields based on network module.
 // Factor sub-wrapper is only relevant for LoKr; everything else is shared.
 function updateLycorisExtrasUI(networkModule) {
@@ -1148,6 +1156,9 @@ function updateLycorisExtrasUI(networkModule) {
   $("lokr-only-fields").classList.toggle("hidden", !isLokr);
 }
 $("cfg-network-module").addEventListener("change", (e) => {
+  // Carry user-edited state across the active-set change: the dropdown handler
+  // is the "user mid-edit" path, in contrast with populateForm which is the
+  // "fresh load" path and just calls loadNetworkArgs directly.
   redistributeForModuleChange();
   updateLycorisExtrasUI(e.target.value);
   checkDirty();
@@ -1158,27 +1169,27 @@ $("cfg-network-module").addEventListener("change", (e) => {
 // (their first-position in the collected list shadows the freeform copy).
 function redistributeForModuleChange() {
   const tokens = [];
-  const f = $("cfg-lokr-factor").value.trim(); if (f) tokens.push(`factor=${f}`);
-  const m = $("cfg-mod-dim").value.trim(); if (m) tokens.push(`mod_dim=${m}`);
-  const r = $("cfg-rank-dropout").value.trim(); if (r) tokens.push(`rank_dropout=${r}`);
-  const d = $("cfg-module-dropout").value.trim(); if (d) tokens.push(`module_dropout=${d}`);
+  const factor = $("cfg-lokr-factor").value.trim();
+  if (factor) tokens.push(`factor=${factor}`);
+  const modDim = $("cfg-mod-dim").value.trim();
+  if (modDim) tokens.push(`mod_dim=${modDim}`);
+  const rankDropout = $("cfg-rank-dropout").value.trim();
+  if (rankDropout) tokens.push(`rank_dropout=${rankDropout}`);
+  const moduleDropout = $("cfg-module-dropout").value.trim();
+  if (moduleDropout) tokens.push(`module_dropout=${moduleDropout}`);
   if ($("cfg-use-tucker").checked) tokens.push("use_tucker=true");
-  const free = $("cfg-network-args").value.trim();
-  if (free) tokens.push(...free.split(/\s+/));
+  const freeform = $("cfg-network-args").value.trim();
+  if (freeform) tokens.push(...freeform.split(/\s+/));
   const seen = new Set();
-  const merged = tokens.filter((t) => {
-    const eq = t.indexOf("=");
-    const k = eq >= 0 ? t.slice(0, eq) : t;
-    if (seen.has(k)) return false;
-    seen.add(k);
+  const merged = tokens.filter((tok) => {
+    const eq = tok.indexOf("=");
+    const key = eq >= 0 ? tok.slice(0, eq) : tok;
+    if (seen.has(key)) return false;
+    seen.add(key);
     return true;
   });
   loadNetworkArgs(merged);
 }
-
-// Keys handled by the LoHa/LoKr dedicated UI fields. Same set drives save and load:
-// dedicated values override matching keys in the freeform Network Args text box.
-const LYCORIS_DEDICATED_KEYS = ["factor", "mod_dim", "rank_dropout", "module_dropout", "use_tucker"];
 
 // Which dedicated keys are "active" for a given network_module. LoKr accepts the
 // full set including factor; LoHa accepts everything except factor; other modules

@@ -48,9 +48,8 @@ network_train_unet_only = true
 
 # network_args: free-form "key=value" strings for networks.loha.create_network.
 # The Web UI exposes Mod Dim, Rank Dropout, Module Dropout, and Use Tucker as
-# dedicated fields; long-tail kwargs (per-type dims, train_block_indices, emb_dims,
-# network_reg_dims/lrs, loraplus_*, conv_dim, train_llm_adapter) only go here or in
-# the UI's free-form Network Args textbox. Full reference: networks/loha.py.
+# dedicated fields; every other kwarg only goes here or in the UI's free-form
+# Network Args textbox. Full reference: networks/loha.py:create_network.
 network_args = [ "mod_dim=4" ]
 
 # To initialize from a LoHa checkpoint:
