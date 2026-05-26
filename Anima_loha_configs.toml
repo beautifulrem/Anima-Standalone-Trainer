@@ -1,5 +1,4 @@
 # Anima LoHa Training Configuration
-# Mirrors Anima_lora_configs.toml; only [network_arguments] is LoHa-specific.
 
 [model_arguments]
 dit_path = "/path/to/anima-preview.safetensors"
@@ -47,47 +46,15 @@ network_dim = 16
 network_alpha = 16
 network_train_unet_only = true
 
-# network_args — free-form "key=value" strings passed to networks.loha.create_network.
-# The Web UI's "Network Args" textbox accepts the same set, space-separated.
-# Every kwarg below is optional; omit for the listed default.
-#
-# Regularization
-#   use_tucker=true|false      Tucker-decompose Conv2d 3x3 (default false)
-#   rank_dropout=0.1           drop ranks each forward, 0..1 (default off)
-#   module_dropout=0.1         drop whole modules each forward, 0..1 (default off)
-#
-# Conv2d 3x3 targeting (off by default — Anima DiT is all Linear)
-#   conv_dim=N                 rank for Conv2d 3x3 layers
-#   conv_alpha=N               alpha for Conv2d 3x3 (defaults to 1.0 when conv_dim set)
-#
-# Anima per-type rank overrides (None = use network_dim, 0 = exclude that family)
-#   self_attn_dim=N            rank for self_attn Linears
-#   cross_attn_dim=N           rank for cross_attn Linears
-#   mlp_dim=N                  rank for MLP layers
-#   mod_dim=N                  rank for adaln_modulation_* (excluded by default; set to opt in)
-#   llm_adapter_dim=N          rank for LLMAdapterTransformerBlock (also requires train_llm_adapter=true)
-#   train_llm_adapter=true     include the LLM adapter targets (default false)
-#   emb_dims=4,4,4             ranks for [x_embedder, t_embedder, final_layer] (single string, 3 ints)
-#   train_block_indices=0-7    selective per-block training: "all" / "none" / "0,2,5-7"
-#
-# Regex overrides on module dotted name (e.g. blocks.0.self_attn.q_proj)
-#   network_reg_dims="blocks\\.0\\..*=32,blocks\\.\\d+\\.mlp.*=8"
-#   network_reg_lrs="blocks\\.0\\..*=1e-4"
-#
-# LoRA+ split learning rate
-#   loraplus_lr_ratio=16                          unified up/down ratio, or split:
-#   loraplus_unet_lr_ratio=16
-#   loraplus_text_encoder_lr_ratio=16
-#
-# Suggested presets (uncomment one):
-#   network_args = []                                                       # baseline: attn + MLP only
-#   network_args = [ "mod_dim=4" ]                                          # + AdaLN modulation (better identity capture)
-#   network_args = [ "mod_dim=4", "rank_dropout=0.1", "module_dropout=0.1" ] # above + regularization
-#   network_args = [ "train_llm_adapter=true", "llm_adapter_dim=4" ]        # also adapt the LLM adapter
-network_args = [ ]
+# network_args: free-form "key=value" strings for networks.loha.create_network.
+# The Web UI exposes Mod Dim, Rank Dropout, Module Dropout, and Use Tucker as
+# dedicated fields; long-tail kwargs (per-type dims, train_block_indices, emb_dims,
+# network_reg_dims/lrs, loraplus_*, conv_dim, train_llm_adapter) only go here or in
+# the UI's free-form Network Args textbox. Full reference: networks/loha.py.
+network_args = [ "mod_dim=4" ]
 
-# To initialize from a LoHa checkpoint (start new training with these weights):
+# To initialize from a LoHa checkpoint:
 # network_weights = "/path/to/loha.safetensors"
 
-# To resume training state (start from a saved state folder):
+# To resume training state from a saved state folder:
 # resume = "/path/to/saved_state_folder"
