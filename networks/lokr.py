@@ -20,6 +20,8 @@ from .network_base import (
     detect_arch_config,
     _parse_kv_pairs,
     _parse_anima_kwargs,
+    _parse_common_create_network_kwargs,
+    _apply_loraplus_from_kwargs,
     _is_tp_active,
 )
 from library.utils import setup_logging
@@ -178,11 +180,10 @@ class LoKrModule(torch.nn.Module):
             else:
                 self.use_w2 = True
                 self.lokr_w2 = nn.Parameter(torch.empty(out_k, in_n))
-                if lora_dim >= max(out_k, in_n) / 2:
-                    logger.warning(
-                        f"LoKr: lora_dim {lora_dim} is large for dim={max(in_dim, out_dim)} "
-                        f"and factor={factor}, using full matrix mode."
-                    )
+                logger.warning(
+                    f"LoKr: lora_dim {lora_dim} is large for dim={max(in_dim, out_dim)} "
+                    f"and factor={factor}, using full matrix mode."
+                )
 
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()
@@ -418,68 +419,8 @@ def create_network(
     text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
     arch_config = detect_arch_config(unet, text_encoders)
     type_dims, emb_dims, train_block_indices = _parse_anima_kwargs(kwargs, unet)
-
-    # train LLM adapter
-    train_llm_adapter = kwargs.get("train_llm_adapter", "false")
-    if train_llm_adapter is not None:
-        train_llm_adapter = True if str(train_llm_adapter).lower() == "true" else False
-
-    # exclude patterns
-    exclude_patterns = kwargs.get("exclude_patterns", None)
-    if exclude_patterns is None:
-        exclude_patterns = []
-    else:
-        exclude_patterns = ast.literal_eval(exclude_patterns)
-        if not isinstance(exclude_patterns, list):
-            exclude_patterns = [exclude_patterns]
-
-    # add default exclude patterns from arch config
-    exclude_patterns.extend(arch_config.default_excludes)
-
-    # include patterns
-    include_patterns = kwargs.get("include_patterns", None)
-    if include_patterns is not None:
-        include_patterns = ast.literal_eval(include_patterns)
-        if not isinstance(include_patterns, list):
-            include_patterns = [include_patterns]
-
-    # rank/module dropout
-    rank_dropout = kwargs.get("rank_dropout", None)
-    if rank_dropout is not None:
-        rank_dropout = float(rank_dropout)
-    module_dropout = kwargs.get("module_dropout", None)
-    if module_dropout is not None:
-        module_dropout = float(module_dropout)
-
-    # conv dim/alpha for Conv2d 3x3
-    conv_lora_dim = kwargs.get("conv_dim", None)
-    conv_alpha = kwargs.get("conv_alpha", None)
-    if conv_lora_dim is not None:
-        conv_lora_dim = int(conv_lora_dim)
-        if conv_alpha is None:
-            conv_alpha = 1.0
-        else:
-            conv_alpha = float(conv_alpha)
-
-    # Tucker decomposition for Conv2d 3x3
-    use_tucker = kwargs.get("use_tucker", "false")
-    if use_tucker is not None:
-        use_tucker = True if str(use_tucker).lower() == "true" else False
-
-    # factor for LoKr
+    common = _parse_common_create_network_kwargs(kwargs, arch_config)
     factor = int(kwargs.get("factor", -1))
-
-    # verbose
-    verbose = kwargs.get("verbose", "false")
-    if verbose is not None:
-        verbose = True if str(verbose).lower() == "true" else False
-
-    # regex-specific learning rates / dimensions
-    network_reg_lrs = kwargs.get("network_reg_lrs", None)
-    reg_lrs = _parse_kv_pairs(network_reg_lrs, is_int=False) if network_reg_lrs is not None else None
-
-    network_reg_dims = kwargs.get("network_reg_dims", None)
-    reg_dims = _parse_kv_pairs(network_reg_dims, is_int=True) if network_reg_dims is not None else None
 
     network = AdditionalNetwork(
         text_encoders,
@@ -489,32 +430,23 @@ def create_network(
         lora_dim=network_dim,
         alpha=network_alpha,
         dropout=neuron_dropout,
-        rank_dropout=rank_dropout,
-        module_dropout=module_dropout,
+        rank_dropout=common["rank_dropout"],
+        module_dropout=common["module_dropout"],
         module_class=LoKrModule,
-        module_kwargs={"factor": factor, "use_tucker": use_tucker},
-        conv_lora_dim=conv_lora_dim,
-        conv_alpha=conv_alpha,
-        train_llm_adapter=train_llm_adapter,
-        exclude_patterns=exclude_patterns,
-        include_patterns=include_patterns,
-        reg_dims=reg_dims,
-        reg_lrs=reg_lrs,
+        module_kwargs={"factor": factor, "use_tucker": common["use_tucker"]},
+        conv_lora_dim=common["conv_lora_dim"],
+        conv_alpha=common["conv_alpha"],
+        train_llm_adapter=common["train_llm_adapter"],
+        exclude_patterns=common["exclude_patterns"],
+        include_patterns=common["include_patterns"],
+        reg_dims=common["reg_dims"],
+        reg_lrs=common["reg_lrs"],
         type_dims=type_dims,
         emb_dims=emb_dims,
         train_block_indices=train_block_indices,
-        verbose=verbose,
+        verbose=common["verbose"],
     )
-
-    loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
-    loraplus_unet_lr_ratio = kwargs.get("loraplus_unet_lr_ratio", None)
-    loraplus_text_encoder_lr_ratio = kwargs.get("loraplus_text_encoder_lr_ratio", None)
-    loraplus_lr_ratio = float(loraplus_lr_ratio) if loraplus_lr_ratio is not None else None
-    loraplus_unet_lr_ratio = float(loraplus_unet_lr_ratio) if loraplus_unet_lr_ratio is not None else None
-    loraplus_text_encoder_lr_ratio = float(loraplus_text_encoder_lr_ratio) if loraplus_text_encoder_lr_ratio is not None else None
-    if loraplus_lr_ratio is not None or loraplus_unet_lr_ratio is not None or loraplus_text_encoder_lr_ratio is not None:
-        network.set_loraplus_lr_ratio(loraplus_lr_ratio, loraplus_unet_lr_ratio, loraplus_text_encoder_lr_ratio)
-
+    _apply_loraplus_from_kwargs(network, kwargs)
     return network
 
 

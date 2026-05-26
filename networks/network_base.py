@@ -5,10 +5,11 @@
 #   - on_step_start no-op for train_network.py:1525 contract
 #   - _is_tp_active(unet) helper for LoHa/LoKr TP/SP guard
 
+import ast
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 from library.sdxl_original_unet import InferSdxlUNet2DConditionModel
@@ -92,8 +93,12 @@ def _parse_anima_kwargs(kwargs: Dict, unet) -> Tuple[Optional[List[Optional[int]
 
     train_block_indices = kwargs.get("train_block_indices", None)
     if train_block_indices is not None:
-        num_blocks = len(unet.blocks) if hasattr(unet, "blocks") else 999
-        train_block_indices = _parse_block_selection(train_block_indices, num_blocks)
+        if not hasattr(unet, "blocks"):
+            raise ValueError(
+                "train_block_indices requires the unet to expose a .blocks attribute; "
+                "silent 999-block fallback removed to surface misconfiguration."
+            )
+        train_block_indices = _parse_block_selection(train_block_indices, len(unet.blocks))
 
     return type_dims, emb_dims, train_block_indices
 
@@ -161,6 +166,68 @@ def _parse_kv_pairs(kv_pair_str: str, is_int: bool) -> Dict[str, Union[int, floa
         except ValueError:
             logger.warning(f"Invalid value for {key}: {value}")
     return pairs
+
+
+def _parse_common_create_network_kwargs(kwargs: Dict, arch_config: ArchConfig) -> Dict[str, Any]:
+    """Parse the LyCORIS-shared kwargs that both LoHa and LoKr accept from
+    --network_args. Returns a dict the caller forwards into AdditionalNetwork.
+    Hoisted out of each create_network to avoid ~50 lines of duplicated parsing.
+    """
+    def _opt_list(name):
+        raw = kwargs.get(name, None)
+        if raw is None:
+            return None
+        parsed = ast.literal_eval(raw)
+        return parsed if isinstance(parsed, list) else [parsed]
+
+    exclude_patterns = _opt_list("exclude_patterns") or []
+    exclude_patterns.extend(arch_config.default_excludes)
+
+    include_patterns = _opt_list("include_patterns")
+
+    rank_dropout = kwargs.get("rank_dropout", None)
+    if rank_dropout is not None:
+        rank_dropout = float(rank_dropout)
+    module_dropout = kwargs.get("module_dropout", None)
+    if module_dropout is not None:
+        module_dropout = float(module_dropout)
+
+    conv_lora_dim = kwargs.get("conv_dim", None)
+    conv_alpha = kwargs.get("conv_alpha", None)
+    if conv_lora_dim is not None:
+        conv_lora_dim = int(conv_lora_dim)
+        conv_alpha = float(conv_alpha) if conv_alpha is not None else 1.0
+
+    reg_lrs_raw = kwargs.get("network_reg_lrs", None)
+    reg_dims_raw = kwargs.get("network_reg_dims", None)
+
+    return {
+        "train_llm_adapter": _str_to_bool(kwargs.get("train_llm_adapter", False)),
+        "exclude_patterns": exclude_patterns,
+        "include_patterns": include_patterns,
+        "rank_dropout": rank_dropout,
+        "module_dropout": module_dropout,
+        "conv_lora_dim": conv_lora_dim,
+        "conv_alpha": conv_alpha,
+        "use_tucker": _str_to_bool(kwargs.get("use_tucker", False)),
+        "verbose": _str_to_bool(kwargs.get("verbose", False)),
+        "reg_lrs": _parse_kv_pairs(reg_lrs_raw, is_int=False) if reg_lrs_raw is not None else None,
+        "reg_dims": _parse_kv_pairs(reg_dims_raw, is_int=True) if reg_dims_raw is not None else None,
+    }
+
+
+def _apply_loraplus_from_kwargs(network, kwargs: Dict) -> None:
+    """If any loraplus_*_lr_ratio kwarg is set, wire it onto the network.
+    No-op when none are provided."""
+    def _opt_float(k):
+        v = kwargs.get(k, None)
+        return float(v) if v is not None else None
+
+    g = _opt_float("loraplus_lr_ratio")
+    u = _opt_float("loraplus_unet_lr_ratio")
+    t = _opt_float("loraplus_text_encoder_lr_ratio")
+    if g is not None or u is not None or t is not None:
+        network.set_loraplus_lr_ratio(g, u, t)
 
 
 class AdditionalNetwork(torch.nn.Module):
