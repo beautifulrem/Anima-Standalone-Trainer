@@ -1,4 +1,4 @@
-# Anima LoRA Training Configuration
+# Anima Training Configuration (LoRA / LoHa / LoKr)
 
 [model_arguments]
 dit_path = "/path/to/anima-preview.safetensors"
@@ -41,14 +41,55 @@ sample_prompts = "./sample_prompts.txt"
 sample_every_n_epochs = 1
 
 [network_arguments]
+# Pick one network module (uncomment the one you want):
 network_module = "networks.lora_anima"
+# network_module = "networks.loha"
+# network_module = "networks.lokr"
+
 network_dim = 16
 network_alpha = 16
 network_train_unet_only = true
 
-# To initialize from a LoRA checkpoint (start new training with these weights):
-# network_weights = "path\\to\\lora.safetensors"
+# network_args: free-form "key=value" strings passed to the chosen module's create_network.
+# The Web UI exposes Factor (LoKr only), Mod Dim, Rank Dropout, Module Dropout, and
+# Use Tucker as dedicated fields. Long-tail kwargs only go here or in the UI's textbox.
+#
+# Suggested defaults per module:
+#   LoRA:  network_args = [ ]
+#   LoHa:  network_args = [ "mod_dim=4" ]
+#   LoKr:  network_args = [ "factor=-1", "mod_dim=4" ]
+#
+# --- LoKr-specific ---
+#   factor=N                        Kronecker factor. -1 (default) auto-factorizes;
+#                                   positive int (e.g. 8, 16) compresses large layers more.
+#
+# --- Shared (LoHa + LoKr) ---
+# Surfaced as dedicated UI fields (also settable here):
+#   mod_dim=N                       rank for adaln_modulation_* (excluded by default; set to opt in)
+#   rank_dropout=N                  drop ranks each forward, 0..1 (default off)
+#   module_dropout=N                drop whole modules each forward, 0..1 (default off)
+#   use_tucker=true|false           Tucker-decompose Conv2d 3x3 (default false; Anima DiT is all Linear)
+#
+# TOML-only (or the UI's free-form Network Args textbox):
+#   conv_dim=N, conv_alpha=N        Conv2d 3x3 targeting (off by default)
+#   self_attn_dim=N, cross_attn_dim=N, mlp_dim=N, llm_adapter_dim=N
+#                                   per-type rank overrides (omit = network_dim; 0 = exclude that family)
+#   train_llm_adapter=true          include LLMAdapterTransformerBlock targets (default false)
+#   emb_dims=4,4,4                  ranks for [x_embedder, t_embedder, final_layer]
+#   train_block_indices=0-7         selective per-block training: "all" / "none" / "0,2,5-7"
+#   network_reg_dims="pat=N,..."    regex on dotted module name → per-pattern dim override
+#   network_reg_lrs="pat=lr,..."    regex on dotted module name → per-pattern LR
+#   loraplus_lr_ratio=N             LoRA+ unified up/down ratio
+#   loraplus_unet_lr_ratio=N        ...or split per side:
+#   loraplus_text_encoder_lr_ratio=N
+#   exclude_patterns="[ 're.*', 'pat.*' ]"   extra regex blacklist (joins arch defaults)
+#   include_patterns="[ 're.*' ]"            regex whitelist (bypasses default_excludes)
+#   verbose=true                    log per-module dim selection at construction
+#
+# Full reference: networks/{lora_anima,loha,lokr}.py:create_network
+
+# To initialize from a checkpoint (start new training with existing weights):
+# network_weights = "/path/to/lora.safetensors"
 
 # To resume training state (start from a saved state folder):
-# resume = "path\\to\\saved_state_folder"
-
+# resume = "/path/to/saved_state_folder"
