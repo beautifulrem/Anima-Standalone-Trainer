@@ -508,7 +508,9 @@ class AdditionalNetwork(torch.nn.Module):
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
 
-        if not self.text_encoder_loras and not self.unet_loras:
+        # Guard fires only on the training path (modules_dim is None signals fresh-create
+        # vs from-weights/inference path which explicitly passes an empty/non-empty dict).
+        if modules_dim is None and not self.text_encoder_loras and not self.unet_loras:
             raise ValueError(
                 f"No modules matched for {module_class.__name__} training. "
                 "Check exclude_patterns/include_patterns/type_dims/train_block_indices "
