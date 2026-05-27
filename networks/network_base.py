@@ -508,6 +508,13 @@ class AdditionalNetwork(torch.nn.Module):
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
 
+        if not self.text_encoder_loras and not self.unet_loras:
+            raise ValueError(
+                f"No modules matched for {module_class.__name__} training. "
+                "Check exclude_patterns/include_patterns/type_dims/train_block_indices "
+                "(downstream would crash with 'optimizer got an empty parameter list')."
+            )
+
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
         for lora in self.text_encoder_loras + self.unet_loras:
@@ -685,7 +692,14 @@ class AdditionalNetwork(torch.nn.Module):
         return all_params, lr_descriptions
 
     def _is_plus_param(self, name: str) -> bool:
-        return "lora_up" in name or "hada_w2_a" in name or "lokr_w1" in name
+        # lokr_w2 is exact-match: only matches LoKr full-matrix mode (use_w2=True),
+        # not low-rank lokr_w2_a/lokr_w2_b which would double-apply the boost.
+        return (
+            "lora_up" in name
+            or "hada_w2_a" in name
+            or "lokr_w1" in name
+            or name == "lokr_w2"
+        )
 
     def enable_gradient_checkpointing(self):
         pass
