@@ -4,7 +4,6 @@
 # Based on the LyCORIS project by KohakuBlueleaf
 # https://github.com/KohakuBlueleaf/LyCORIS
 
-import ast
 import math
 import os
 import logging
