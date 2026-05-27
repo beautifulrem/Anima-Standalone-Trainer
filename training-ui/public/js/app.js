@@ -1147,16 +1147,20 @@ $("cfg-training-type").addEventListener("change", (e) => {
 // the freeform Network Args text box.
 const LYCORIS_DEDICATED_KEYS = ["factor", "mod_dim", "rank_dropout", "module_dropout", "use_tucker"];
 
-// Read a dedicated number field. Returns the value string if valid (non-empty,
-// finite, integer when requireInt), else null. Backend already validates, but
-// dropping obviously-bad UI values here avoids emitting "factor=abc" or
-// "rank_dropout=NaN" tokens that would crash deep in Python.
+// Read a dedicated number field. Returns the value string if valid, else null.
+// Validation is regex-based on the string form because Number()-based checks
+// would accept e.g. "1e2"/"0x10"/"5.0" as integers — those parse fine in JS
+// but Python's int() rejects them, crashing training. Backend would still
+// reject; this is just a friendlier UX layer.
 function _readNumberField(id, requireInt) {
   const v = $(id).value.trim();
   if (v === "") return null;
-  const n = Number(v);
-  if (!Number.isFinite(n)) return null;
-  if (requireInt && !Number.isInteger(n)) return null;
+  const pattern = requireInt
+    ? /^-?\d+$/                              // plain decimal int (e.g. -1, 0, 8)
+    : /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;     // standard float, scientific allowed (e.g. 0.1, 1e-3)
+  if (!pattern.test(v)) return null;
+  // Catch overflow that the regex alone doesn't reject (e.g. 1e1000 -> Infinity).
+  if (!Number.isFinite(Number(v))) return null;
   return v;
 }
 
