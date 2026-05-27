@@ -167,10 +167,7 @@ class LoHaModule(torch.nn.Module):
         self.in_dim = in_dim
         self.out_dim = out_dim
 
-        # Create parameters based on mode
         if self.conv_mode == "tucker":
-            # Tucker decomposition for Conv2d 3x3+
-            # Shapes follow LyCORIS convention: w_a = (rank, out_dim), w_b = (rank, in_dim)
             self.hada_t1 = nn.Parameter(torch.empty(lora_dim, lora_dim, *kernel_size))
             self.hada_w1_a = nn.Parameter(torch.empty(lora_dim, out_dim))
             self.hada_w1_b = nn.Parameter(torch.empty(lora_dim, in_dim))
@@ -186,7 +183,6 @@ class LoHaModule(torch.nn.Module):
             torch.nn.init.normal_(self.hada_w2_b, std=1.0)
             torch.nn.init.normal_(self.hada_w2_a, std=0.1)
         elif self.conv_mode == "flat":
-            # Non-Tucker Conv2d 3x3+: flatten kernel into in_dim
             k_prod = 1
             for k in kernel_size:
                 k_prod *= k
@@ -202,7 +198,6 @@ class LoHaModule(torch.nn.Module):
             torch.nn.init.constant_(self.hada_w2_a, 0)
             torch.nn.init.normal_(self.hada_w2_b, std=1.0)
         else:
-            # Linear or Conv2d 1x1
             self.hada_w1_a = nn.Parameter(torch.empty(out_dim, lora_dim))
             self.hada_w1_b = nn.Parameter(torch.empty(lora_dim, in_dim))
             self.hada_w2_a = nn.Parameter(torch.empty(out_dim, lora_dim))
@@ -256,14 +251,12 @@ class LoHaModule(torch.nn.Module):
     def forward(self, x):
         org_forwarded = self.org_forward(x)
 
-        # module dropout
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
         diff_weight = self.get_diff_weight()
 
-        # rank dropout (applied on output dimension)
         if self.rank_dropout is not None and self.training:
             drop = (torch.rand(diff_weight.size(0), device=diff_weight.device) > self.rank_dropout).to(diff_weight.dtype)
             drop = drop.view(-1, *([1] * (diff_weight.dim() - 1)))
@@ -280,7 +273,6 @@ class LoHaModule(torch.nn.Module):
                     dilation=self.dilation, groups=self.groups
                 ) * self.multiplier * scale
             else:
-                # Conv2d 3x3+: diff_weight is already 4D from get_diff_weight
                 return org_forwarded + F.conv2d(
                     x, diff_weight, stride=self.stride, padding=self.padding,
                     dilation=self.dilation, groups=self.groups
@@ -309,7 +301,6 @@ class LoHaInfModule(LoHaModule):
         alpha=1,
         **kwargs,
     ):
-        # no dropout for inference; pass use_tucker from kwargs
         use_tucker = kwargs.pop("use_tucker", False)
         super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, use_tucker=use_tucker)
 
@@ -321,8 +312,7 @@ class LoHaInfModule(LoHaModule):
         self.network = network
 
     def merge_to(self, sd, dtype, device):
-        # Use org_module_ref so merge_to still works after apply_to() has
-        # `del`'d self.org_module — order [apply_to → merge_to] used to crash.
+        # org_module_ref survives apply_to() which del's self.org_module
         org_module = self.org_module_ref[0]
         org_sd = org_module.state_dict()
         weight = org_sd["weight"]
@@ -472,7 +462,6 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
         else:
             weights_sd = torch.load(file, map_location="cpu")
 
-    # detect dim/alpha from weights
     modules_dim = {}
     modules_alpha = {}
     train_llm_adapter = False
@@ -490,13 +479,8 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
         if "llm_adapter" in lora_name:
             train_llm_adapter = True
 
-    # detect Tucker mode from weights
     use_tucker = any("hada_t1" in key for key in weights_sd.keys())
-
-    # handle text_encoder as list
     text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
-
-    # detect architecture
     arch_config = detect_arch_config(unet, text_encoders)
 
     module_class = LoHaInfModule if for_inference else LoHaModule
@@ -573,8 +557,6 @@ def merge_weights_to_tensor(
         # Standard LoHa: ΔW = ((w1a @ w1b) * (w2a @ w2b)) * scale
         diff_weight = ((w1a @ w1b) * (w2a @ w2b)) * scale
 
-    # Reshape diff_weight to match model_weight shape if needed
-    # (handles Conv2d 1x1 unsqueeze, Conv2d 3x3 non-Tucker reshape, etc.)
     if diff_weight.shape != model_weight.shape:
         diff_weight = diff_weight.reshape(model_weight.shape)
 
@@ -583,7 +565,6 @@ def merge_weights_to_tensor(
     if original_dtype.itemsize == 1:
         model_weight = model_weight.to(original_dtype)
 
-    # remove consumed keys
     consumed = [w1a_key, w1b_key, w2a_key, w2b_key, alpha_key]
     if has_tucker:
         consumed.extend([t1_key, t2_key])

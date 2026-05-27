@@ -16,7 +16,6 @@ COMFYUI_QWEN3_PREFIX = "text_encoders.qwen3_06b.transformer.model."
 
 
 def main(args):
-    # load source safetensors
     logger.info(f"Loading source file {args.src_path}")
     state_dict = {}
     with safe_open(args.src_path, framework="pt") as f:
@@ -43,33 +42,23 @@ def main(args):
                 state_dict.pop(k)
                 continue
 
-            # Split at the first dot, e.g., "block1_linear.weight" -> "block1_linear", "weight"
             module_name, weight_name = module_and_weight_name.split(".", 1)
 
-            # Weight name conversion: lora_up/lora_down to lora_A/lora_B
             if weight_name.startswith("lora_up"):
                 weight_name = weight_name.replace("lora_up", "lora_B")
             elif weight_name.startswith("lora_down"):
                 weight_name = weight_name.replace("lora_down", "lora_A")
-            else:
-                # Keep other weight names as-is: e.g. alpha
-                pass
 
-            # Module name conversion: convert dots to underscores
-            original_module_name = module_name.replace("_", ".")  # Convert to dot notation
+            # _ → . then collapse multi-token attributes back via targeted replacements
+            original_module_name = module_name.replace("_", ".")
 
-            # Convert back illegal dots in module names
             # DiT
             original_module_name = original_module_name.replace("llm.adapter", "llm_adapter")
             original_module_name = original_module_name.replace(".linear.", ".linear_")
             original_module_name = original_module_name.replace("t.embedding.norm", "t_embedding_norm")
             original_module_name = original_module_name.replace("x.embedder", "x_embedder")
             original_module_name = original_module_name.replace("t.embedder", "t_embedder")
-            # All underscores already became dots, so LHS must use dots too —
-            # the upstream LHS "cross_attn" never matched and silently produced
-            # "adaln_modulation.cross_attn" (split path) instead of the real
-            # Block attribute "adaln_modulation_cross_attn" (single attribute).
-            # Same for self_attn (which upstream forgot entirely).
+            # Block attributes are single names (adaln_modulation_cross_attn, not nested dots)
             original_module_name = original_module_name.replace("adaln.modulation.cross.attn", "adaln_modulation_cross_attn")
             original_module_name = original_module_name.replace("adaln.modulation.self.attn", "adaln_modulation_self_attn")
             original_module_name = original_module_name.replace("adaln.modulation.mlp", "adaln_modulation_mlp")
@@ -94,9 +83,7 @@ def main(args):
             original_module_name = original_module_name.replace("up.proj", "up_proj")
             original_module_name = original_module_name.replace("post.attention.layernorm", "post_attention_layernorm")
 
-            # Prefix conversion
             new_prefix = COMFYUI_DIT_PREFIX if is_dit_lora else COMFYUI_QWEN3_PREFIX
-
             new_k = f"{new_prefix}{original_module_name}.{weight_name}"
         else:
             if k.startswith(COMFYUI_DIT_PREFIX):
@@ -115,8 +102,7 @@ def main(args):
                 state_dict.pop(k)
                 continue
 
-            # Get weight name. Dispatch on the family-specific separator so the
-            # module path (which contains dots) doesn't get split at the wrong place.
+            # Dispatch on family-specific separator to avoid splitting the dotted module path
             if ".lora_" in module_and_weight_name:
                 module_name, weight_name = module_and_weight_name.rsplit(".lora_", 1)
                 weight_name = "lora_" + weight_name
@@ -136,8 +122,6 @@ def main(args):
 
             module_name = module_name.replace(".", "_")
 
-            # TE prefix is lora_te1_ to match network_base.detect_arch_config Anima pin;
-            # diverges from sd-scripts upstream (lora_te_) on purpose.
             prefix = "lora_unet_" if is_dit_lora else "lora_te1_"
 
             new_k = f"{prefix}{module_name}.{weight_name}"
@@ -153,14 +137,12 @@ def main(args):
             f"Only {count} out of {len(keys)} keys were converted. Please check if there are unexpected keys in the source file."
         )
 
-    # Calculate hash
     if metadata is not None:
         logger.info(f"Calculating hashes and creating metadata...")
         model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(state_dict, metadata)
         metadata["sshs_model_hash"] = model_hash
         metadata["sshs_legacy_hash"] = legacy_hash
 
-    # save destination safetensors
     logger.info(f"Saving destination file {args.dst_path}")
     save_file(state_dict, args.dst_path, metadata=metadata)
 

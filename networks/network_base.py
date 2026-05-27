@@ -1,9 +1,4 @@
 # Shared network base for LyCORIS-family modules (LoHa, LoKr, etc).
-# Ported from sd-scripts/networks/network_base.py with Anima knobs:
-#   - te_prefixes pinned to ["lora_te1"] for Anima (matches lora_anima.py:701)
-#   - type_dims / emb_dims / train_block_indices kwargs on AdditionalNetwork
-#   - on_step_start no-op for train_network.py:1525 contract
-#   - _is_tp_active(unet) helper for LoHa/LoKr TP/SP guard
 
 import ast
 import os
@@ -55,8 +50,7 @@ def detect_arch_config(unet, text_encoders) -> ArchConfig:
         for module in unet.modules():
             module_class_names.add(type(module).__name__)
 
-    # Check for Anima's specific Block + companion classes (PatchEmbed, FinalLayer) to
-    # distinguish from generic "Block" classes in other architectures.
+    # Anima: require all three marker classes to avoid false-positive on generic "Block"
     anima_markers = {"Block", "PatchEmbed", "FinalLayer"}
     if anima_markers.issubset(module_class_names):
         return ArchConfig(
@@ -140,11 +134,7 @@ def _str_to_bool(v) -> bool:
 
 
 def _is_tp_active(unet) -> bool:
-    """Return True if the unet has any TP-sharded Linear children.
-
-    Used by LoHa/LoKr to refuse construction under wd_parallel TP/SP.
-    Scans by class name so this works even when wd_parallel isn't importable.
-    """
+    """Return True if unet has TP-sharded Linear children (scans by class name)."""
     if unet is None:
         return False
     tp_class_names = ("ColumnParallelLinear", "RowParallelLinear")
@@ -157,9 +147,7 @@ def _is_tp_active(unet) -> bool:
 _MAX_KV_PAIR_STR_LEN = 16384  # cap user-supplied --network_args string size
 
 def _precompile_regex_kv(d: Optional[Dict[str, Any]]) -> Optional[List[Tuple[re.Pattern, Any, str]]]:
-    """Compile each key of a {regex_str: value} dict to a 3-tuple
-    (compiled_pattern, value, original_str). Bad patterns are dropped with
-    a warning so construction doesn't fail in the per-module hot loop."""
+    """Compile {regex_str: value} → list of (pattern, value, original_str); bad regexes skipped."""
     if d is None:
         return None
     compiled = []
@@ -198,10 +186,7 @@ def _parse_kv_pairs(kv_pair_str: str, is_int: bool) -> Dict[str, Union[int, floa
 
 
 def _parse_common_create_network_kwargs(kwargs: Dict, arch_config: ArchConfig) -> Dict[str, Any]:
-    """Parse the LyCORIS-shared kwargs that both LoHa and LoKr accept from
-    --network_args. Returns a dict the caller forwards into AdditionalNetwork.
-    Hoisted out of each create_network to avoid ~50 lines of duplicated parsing.
-    """
+    """Parse LyCORIS-shared kwargs (LoHa + LoKr) into a dict for AdditionalNetwork."""
     def _opt_cast(name, ctor):
         v = kwargs.get(name, None)
         return ctor(v) if v is not None else None
@@ -214,8 +199,7 @@ def _parse_common_create_network_kwargs(kwargs: Dict, arch_config: ArchConfig) -
         raw = kwargs.get(name, None)
         if raw is None:
             return None
-        # Already a list (programmatic caller bypassing CLI parsing) — copy so
-        # the caller's list isn't mutated by the downstream .extend() call.
+        # Copy so downstream .extend() doesn't mutate the caller's list
         if isinstance(raw, list):
             return list(raw)
         if isinstance(raw, str) and len(raw) > _MAX_KV_PAIR_STR_LEN:
@@ -253,8 +237,7 @@ def _parse_common_create_network_kwargs(kwargs: Dict, arch_config: ArchConfig) -
 
 
 def _apply_loraplus_from_kwargs(network, kwargs: Dict) -> None:
-    """If any loraplus_*_lr_ratio kwarg is set, wire it onto the network.
-    No-op when none are provided."""
+    """Wire loraplus_*_lr_ratio kwargs onto network if any are set."""
     def _opt_float(k):
         v = kwargs.get(k, None)
         return float(v) if v is not None else None
@@ -267,13 +250,7 @@ def _apply_loraplus_from_kwargs(network, kwargs: Dict) -> None:
 
 
 class AdditionalNetwork(torch.nn.Module):
-    """Generic Additional network supporting LoHa, LoKr, and similar module types.
-
-    Constructed with a module_class parameter to inject the specific module type.
-    Generalized from lora_anima.py:LoRANetwork, supports the same Anima knobs
-    (type_dims / emb_dims / train_block_indices / train_llm_adapter) so LoHa
-    and LoKr configs port cleanly between LoRA and LoHa/LoKr.
-    """
+    """Generic LyCORIS-family network (LoHa, LoKr, ...) with Anima per-type knobs."""
 
     def __init__(
         self,
@@ -316,8 +293,7 @@ class AdditionalNetwork(torch.nn.Module):
         self.train_llm_adapter = train_llm_adapter
         self.reg_dims = reg_dims
         self.reg_lrs = reg_lrs
-        # Compile once instead of inside the per-module hot loop. Bad patterns
-        # are dropped at compile time so a typo doesn't kill construction.
+        # Pre-compile regex; invalid patterns warned and dropped here
         self._reg_dims_compiled = _precompile_regex_kv(reg_dims)
         self._reg_lrs_compiled = _precompile_regex_kv(reg_lrs)
         self.arch_config = arch_config
@@ -380,9 +356,7 @@ class AdditionalNetwork(torch.nn.Module):
                             original_name = (name + "." if name else "") + child_name
                             lora_name = f"{prefix}.{original_name}".replace(".", "_")
 
-                            # `filter` is a positive selector for the emb_dims second-pass;
-                            # if set and not matched, skip immediately. A matched filter
-                            # is also an explicit user request → bypass default_excludes.
+                            # `filter` is a positive selector; matched = explicit user request
                             force_incl_conv2d = False
                             explicit_include = False
                             if filter is not None:
@@ -416,8 +390,7 @@ class AdditionalNetwork(torch.nn.Module):
                                         dim = self.conv_lora_dim
                                         alpha_val = self.conv_alpha
 
-                                # Anima per-type dim dispatch (mirrors lora_anima.py:797-825).
-                                # An explicit non-None type_dims entry overrides default_excludes.
+                                # Anima per-type dim dispatch; explicit entry overrides default_excludes
                                 if is_unet and self.type_dims is not None and dim is not None:
                                     identifier_order = [
                                         (4, ("llm_adapter",)),
@@ -433,7 +406,7 @@ class AdditionalNetwork(torch.nn.Module):
                                             explicit_include = True
                                             break
 
-                                # Anima block-index gating (mirrors lora_anima.py:814-825)
+                                # Anima block-index gating
                                 if is_unet and dim and self.train_block_indices is not None and "blocks_" in lora_name:
                                     parts = lora_name.split("_")
                                     for pi, part in enumerate(parts):
@@ -446,10 +419,7 @@ class AdditionalNetwork(torch.nn.Module):
                                                 pass
                                             break
 
-                            # Apply exclude/include patterns AFTER dim determination so
-                            # that explicit user knobs (filter, type_dims, reg_dims,
-                            # modules_dim) can override default_excludes. User-supplied
-                            # include_patterns also override exclude_patterns.
+                            # Apply exclude/include AFTER dim — explicit knobs override default_excludes
                             if not explicit_include:
                                 excluded = any(p.fullmatch(original_name) for p in exclude_re_patterns)
                                 included = any(p.fullmatch(original_name) for p in include_re_patterns)
