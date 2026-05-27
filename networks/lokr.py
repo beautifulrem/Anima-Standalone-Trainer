@@ -185,8 +185,8 @@ class LoKrModule(torch.nn.Module):
                     f"and factor={factor}, using full matrix mode."
                 )
 
-        if type(alpha) == torch.Tensor:
-            alpha = alpha.detach().float().numpy()
+        if isinstance(alpha, torch.Tensor):
+            alpha = alpha.detach().cpu().float().item()
         alpha = lora_dim if alpha is None or alpha == 0 else alpha
         # if both w1 and w2 are full matrices, use scale = 1
         if self.use_w2:

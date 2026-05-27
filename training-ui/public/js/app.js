@@ -1156,8 +1156,8 @@ function _readNumberField(id, requireInt) {
   const v = $(id).value.trim();
   if (v === "") return null;
   const pattern = requireInt
-    ? /^-?\d+$/                              // plain decimal int (e.g. -1, 0, 8)
-    : /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;     // standard float, scientific allowed (e.g. 0.1, 1e-3)
+    ? /^[+-]?\d+$/                                   // plain decimal int (e.g. -1, 0, +8)
+    : /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;    // float: 0.1, .5, 5., +0.1, 1e-3
   if (!pattern.test(v)) return null;
   // Catch overflow that the regex alone doesn't reject (e.g. 1e1000 -> Infinity).
   if (!Number.isFinite(Number(v))) return null;

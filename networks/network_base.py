@@ -55,7 +55,10 @@ def detect_arch_config(unet, text_encoders) -> ArchConfig:
         for module in unet.modules():
             module_class_names.add(type(module).__name__)
 
-    if "Block" in module_class_names:
+    # Check for Anima's specific Block + companion classes (PatchEmbed, FinalLayer) to
+    # distinguish from generic "Block" classes in other architectures.
+    anima_markers = {"Block", "PatchEmbed", "FinalLayer"}
+    if anima_markers.issubset(module_class_names):
         return ArchConfig(
             unet_target_modules=["Block", "PatchEmbed", "TimestepEmbedding", "FinalLayer"],
             te_target_modules=["Qwen3Attention", "Qwen3MLP", "Qwen3SdpaAttention", "Qwen3FlashAttention2"],
@@ -89,7 +92,8 @@ def _parse_anima_kwargs(kwargs: Dict, unet) -> Tuple[Optional[List[Optional[int]
         if emb_dims.startswith("[") and emb_dims.endswith("]"):
             emb_dims = emb_dims[1:-1]
         emb_dims = [int(d) for d in emb_dims.split(",")]
-        assert len(emb_dims) == 3, f"invalid emb_dims: {emb_dims}, must be 3 dimensions (x_embedder, t_embedder, final_layer)"
+        if len(emb_dims) != 3:
+            raise ValueError(f"emb_dims must have exactly 3 values (x_embedder, t_embedder, final_layer), got {len(emb_dims)}: {emb_dims}")
 
     train_block_indices = kwargs.get("train_block_indices", None)
     if train_block_indices is not None:
@@ -114,12 +118,14 @@ def _parse_block_selection(selection: str, total_blocks: int) -> List[bool]:
         if "-" in r:
             start, end = map(str.strip, r.split("-"))
             start, end = int(start), int(end)
-            assert 0 <= start < total_blocks and 0 <= end < total_blocks and start <= end
+            if not (0 <= start < total_blocks and 0 <= end < total_blocks and start <= end):
+                raise ValueError(f"train_block_indices range '{r.strip()}' is invalid for {total_blocks} blocks")
             for i in range(start, end + 1):
                 selected[i] = True
         else:
-            index = int(r)
-            assert 0 <= index < total_blocks
+            index = int(r.strip())
+            if not (0 <= index < total_blocks):
+                raise ValueError(f"train_block_indices index {index} out of range for {total_blocks} blocks")
             selected[index] = True
     return selected
 
@@ -208,9 +214,10 @@ def _parse_common_create_network_kwargs(kwargs: Dict, arch_config: ArchConfig) -
         raw = kwargs.get(name, None)
         if raw is None:
             return None
-        # Already a list (programmatic caller bypassing CLI parsing) — keep as-is.
+        # Already a list (programmatic caller bypassing CLI parsing) — copy so
+        # the caller's list isn't mutated by the downstream .extend() call.
         if isinstance(raw, list):
-            return raw
+            return list(raw)
         if isinstance(raw, str) and len(raw) > _MAX_KV_PAIR_STR_LEN:
             logger.warning(f"{name} length {len(raw)} exceeds cap {_MAX_KV_PAIR_STR_LEN}; ignoring")
             return None
@@ -593,7 +600,7 @@ class AdditionalNetwork(torch.nn.Module):
         for lora in self.text_encoder_loras + self.unet_loras:
             sd_for_lora = {}
             for key in weights_sd.keys():
-                if key.startswith(lora.lora_name):
+                if key.startswith(lora.lora_name + "."):
                     sd_for_lora[key[len(lora.lora_name) + 1 :]] = weights_sd[key]
             lora.merge_to(sd_for_lora, dtype, device)
 

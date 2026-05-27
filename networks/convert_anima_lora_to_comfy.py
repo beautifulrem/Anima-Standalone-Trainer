@@ -32,6 +32,10 @@ def main(args):
     for k in keys:
         if not args.reverse:
             is_dit_lora = k.startswith("lora_unet_")
+            if not is_dit_lora and not k.startswith("lora_te"):
+                logger.warning(f"Skipping key with unrecognized prefix: {k}")
+                state_dict.pop(k)
+                continue
             module_and_weight_name = "_".join(k.split("_")[2:])  # Remove `lora_unet_`or `lora_te_` prefix
 
             if "." not in module_and_weight_name:
@@ -60,6 +64,7 @@ def main(args):
             original_module_name = original_module_name.replace(".linear.", ".linear_")
             original_module_name = original_module_name.replace("t.embedding.norm", "t_embedding_norm")
             original_module_name = original_module_name.replace("x.embedder", "x_embedder")
+            original_module_name = original_module_name.replace("t.embedder", "t_embedder")
             # All underscores already became dots, so LHS must use dots too —
             # the upstream LHS "cross_attn" never matched and silently produced
             # "adaln_modulation.cross_attn" (split path) instead of the real
