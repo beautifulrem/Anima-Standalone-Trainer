@@ -1200,7 +1200,7 @@ function redistributeForModuleChange() {
   const seen = new Set();
   const merged = tokens.filter((tok) => {
     const eq = tok.indexOf("=");
-    const key = eq >= 0 ? tok.slice(0, eq) : tok;
+    const key = (eq >= 0 ? tok.slice(0, eq) : tok).trim();
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -1246,7 +1246,7 @@ function gatherNetworkArgs() {
   const freeform = freeformRaw
     ? freeformRaw.split(/\s+/).filter((tok) => {
         const eq = tok.indexOf("=");
-        const key = eq >= 0 ? tok.slice(0, eq) : tok;
+        const key = (eq >= 0 ? tok.slice(0, eq) : tok).trim();
         return !active.includes(key);
       })
     : [];
@@ -1270,8 +1270,12 @@ function loadNetworkArgs(args) {
       freeform.push(tok);
       continue;
     }
-    const key = tok.slice(0, eq);
-    const val = tok.slice(eq + 1);
+    // Inner-trim each part: TOML can carry "factor = 8" with spaces around `=`,
+    // which would otherwise produce key="factor " (trailing ws) → active.includes
+    // fails → silent freeform misclassification. Symmetric on val so number inputs
+    // don't receive leading/trailing whitespace.
+    const key = tok.slice(0, eq).trim();
+    const val = tok.slice(eq + 1).trim();
     if (active.includes(key)) dedicated[key] = val;
     else freeform.push(tok);
   }
