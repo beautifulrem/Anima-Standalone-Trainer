@@ -1147,6 +1147,19 @@ $("cfg-training-type").addEventListener("change", (e) => {
 // the freeform Network Args text box.
 const LYCORIS_DEDICATED_KEYS = ["factor", "mod_dim", "rank_dropout", "module_dropout", "use_tucker"];
 
+// Read a dedicated number field. Returns the value string if valid (non-empty,
+// finite, integer when requireInt), else null. Backend already validates, but
+// dropping obviously-bad UI values here avoids emitting "factor=abc" or
+// "rank_dropout=NaN" tokens that would crash deep in Python.
+function _readNumberField(id, requireInt) {
+  const v = $(id).value.trim();
+  if (v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  if (requireInt && !Number.isInteger(n)) return null;
+  return v;
+}
+
 // Show/hide LoHa/LoKr dedicated fields based on network module.
 // Factor sub-wrapper is only relevant for LoKr; everything else is shared.
 function updateLycorisExtrasUI(networkModule) {
@@ -1169,14 +1182,14 @@ $("cfg-network-module").addEventListener("change", (e) => {
 // (their first-position in the collected list shadows the freeform copy).
 function redistributeForModuleChange() {
   const tokens = [];
-  const factor = $("cfg-lokr-factor").value.trim();
-  if (factor) tokens.push(`factor=${factor}`);
-  const modDim = $("cfg-mod-dim").value.trim();
-  if (modDim) tokens.push(`mod_dim=${modDim}`);
-  const rankDropout = $("cfg-rank-dropout").value.trim();
-  if (rankDropout) tokens.push(`rank_dropout=${rankDropout}`);
-  const moduleDropout = $("cfg-module-dropout").value.trim();
-  if (moduleDropout) tokens.push(`module_dropout=${moduleDropout}`);
+  const factor = _readNumberField("cfg-lokr-factor", true);
+  if (factor !== null) tokens.push(`factor=${factor}`);
+  const modDim = _readNumberField("cfg-mod-dim", true);
+  if (modDim !== null) tokens.push(`mod_dim=${modDim}`);
+  const rankDropout = _readNumberField("cfg-rank-dropout", false);
+  if (rankDropout !== null) tokens.push(`rank_dropout=${rankDropout}`);
+  const moduleDropout = _readNumberField("cfg-module-dropout", false);
+  if (moduleDropout !== null) tokens.push(`module_dropout=${moduleDropout}`);
   if ($("cfg-use-tucker").checked) tokens.push("use_tucker=true");
   const freeform = $("cfg-network-args").value.trim();
   if (freeform) tokens.push(...freeform.split(/\s+/));
@@ -1207,20 +1220,20 @@ function gatherNetworkArgs() {
   const active = activeDedicatedKeys($("cfg-network-module").value);
   const dedicated = [];
   if (active.includes("factor")) {
-    const v = $("cfg-lokr-factor").value.trim();
-    if (v !== "") dedicated.push(`factor=${v}`);
+    const v = _readNumberField("cfg-lokr-factor", true);
+    if (v !== null) dedicated.push(`factor=${v}`);
   }
   if (active.includes("mod_dim")) {
-    const v = $("cfg-mod-dim").value.trim();
-    if (v !== "") dedicated.push(`mod_dim=${v}`);
+    const v = _readNumberField("cfg-mod-dim", true);
+    if (v !== null) dedicated.push(`mod_dim=${v}`);
   }
   if (active.includes("rank_dropout")) {
-    const v = $("cfg-rank-dropout").value.trim();
-    if (v !== "") dedicated.push(`rank_dropout=${v}`);
+    const v = _readNumberField("cfg-rank-dropout", false);
+    if (v !== null) dedicated.push(`rank_dropout=${v}`);
   }
   if (active.includes("module_dropout")) {
-    const v = $("cfg-module-dropout").value.trim();
-    if (v !== "") dedicated.push(`module_dropout=${v}`);
+    const v = _readNumberField("cfg-module-dropout", false);
+    if (v !== null) dedicated.push(`module_dropout=${v}`);
   }
   if (active.includes("use_tucker") && $("cfg-use-tucker").checked) {
     dedicated.push("use_tucker=true");
@@ -1243,7 +1256,11 @@ function loadNetworkArgs(args) {
   const active = activeDedicatedKeys($("cfg-network-module").value);
   const dedicated = {};
   const freeform = [];
-  for (const tok of args) {
+  for (const raw of args) {
+    // Trim per-token: TOML arrays can legally contain "  factor=8  " entries; the
+    // split-on-/\s+/ path doesn't, but the array-from-disk path needs hygiene here.
+    const tok = String(raw).trim();
+    if (!tok) continue;
     const eq = tok.indexOf("=");
     if (eq < 0) {
       freeform.push(tok);

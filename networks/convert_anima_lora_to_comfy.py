@@ -79,9 +79,6 @@ def main(args):
             original_module_name = original_module_name.replace("self.attn", "self_attn")
             original_module_name = original_module_name.replace("final.layer", "final_layer")
             original_module_name = original_module_name.replace("adaln.modulation", "adaln_modulation")
-            original_module_name = original_module_name.replace("norm.cross.attn", "norm_cross_attn")
-            original_module_name = original_module_name.replace("norm.mlp", "norm_mlp")
-            original_module_name = original_module_name.replace("norm.self.attn", "norm_self_attn")
             original_module_name = original_module_name.replace("out.proj", "out_proj")
 
             # Qwen3
@@ -105,6 +102,11 @@ def main(args):
                 module_and_weight_name = k[len(COMFYUI_QWEN3_PREFIX) :]
             else:
                 logger.warning(f"Skipping unrecognized key {k}")
+                state_dict.pop(k)
+                continue
+
+            if "." not in module_and_weight_name:
+                logger.warning(f"Skipping malformed key (no separator dot after prefix): {k}")
                 state_dict.pop(k)
                 continue
 

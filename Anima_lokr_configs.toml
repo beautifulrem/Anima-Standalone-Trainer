@@ -68,6 +68,9 @@ network_train_unet_only = true
 #   loraplus_lr_ratio=N             LoRA+ unified up/down ratio
 #   loraplus_unet_lr_ratio=N        ...or split per side:
 #   loraplus_text_encoder_lr_ratio=N
+#   exclude_patterns="[ 're.*', 'pat.*' ]"   extra regex blacklist (joins arch defaults)
+#   include_patterns="[ 're.*' ]"            regex whitelist (bypasses default_excludes)
+#   verbose=true                    log per-module dim selection at construction
 #
 # Full reference: networks/lokr.py:create_network
 network_args = [ "factor=-1", "mod_dim=4" ]
