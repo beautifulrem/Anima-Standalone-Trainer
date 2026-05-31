@@ -234,13 +234,21 @@ class LoKrModule(torch.nn.Module):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
+        # Neuron dropout: regularize the adapter's input activations only (the frozen
+        # base path above already used the full x). Mirrors lora_anima.py; without this a
+        # set network_dropout was logged as active (network_base.py) but never applied.
+        if self.dropout is not None and self.dropout > 0 and self.training:
+            x = F.dropout(x, p=self.dropout)
+
         diff_weight = self.get_diff_weight()
 
         if self.rank_dropout is not None and self.training:
             drop = (torch.rand(diff_weight.size(0), device=diff_weight.device) > self.rank_dropout).to(diff_weight.dtype)
             drop = drop.view(-1, *([1] * (diff_weight.dim() - 1)))
             diff_weight = diff_weight * drop
-            scale = 1.0 / (1.0 - self.rank_dropout)
+            # rank_dropout == 1.0 (the UI permits it) drops everything; guard the
+            # 1/(1-p) division so the degenerate "drop all" case yields 0, not a crash.
+            scale = 1.0 / (1.0 - self.rank_dropout) if self.rank_dropout < 1.0 else 0.0
         else:
             scale = 1.0
 
