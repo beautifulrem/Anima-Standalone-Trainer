@@ -273,6 +273,11 @@ class LoHaModule(torch.nn.Module):
         else:
             scale = 1.0
 
+        # Adapter params stay fp32; the AdaLN fp32-stability path (anima_models.py) runs
+        # with autocast off and feeds fp16 x, so F.linear(fp16, fp32) would crash. Cast the
+        # delta to x's dtype — the patched-LoRA matmul is meant to stay in x's dtype.
+        diff_weight = diff_weight.to(x.dtype)
+
         if self.is_conv:
             if self.conv_mode == "1x1":
                 diff_weight = diff_weight.unsqueeze(2).unsqueeze(3)
