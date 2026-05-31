@@ -64,6 +64,43 @@ def factorization(dimension: int, factor: int = -1) -> tuple:
     return m, n
 
 
+def _infer_lokr_factor_from_weights(weights_sd):
+    """Recover the global LoKr factor from saved tensor shapes, for checkpoints with no
+    metadata (.pt / .ckpt / --no_metadata). Returns a factor that reproduces every saved
+    module's factorization, else -1. A wrong guess can only fail louder downstream
+    (load_state_dict size check) — it can never silently mis-load, because the merge path
+    no longer depends on factor. Tucker modules are skipped (ambiguous w2 orientation)."""
+    mods = []
+    for key in list(weights_sd.keys()):
+        if not key.endswith(".lokr_w1"):
+            continue
+        name = key[: -len(".lokr_w1")]
+        if (name + ".lokr_t2") in weights_sd:
+            continue
+        w1 = weights_sd[key]
+        out_l, in_m = int(w1.shape[0]), int(w1.shape[1])
+        if (name + ".lokr_w2") in weights_sd:
+            w2 = weights_sd[name + ".lokr_w2"]
+            out_k, in_n = int(w2.shape[0]), int(w2.shape[1])
+        else:
+            w2a = weights_sd.get(name + ".lokr_w2_a")
+            w2b = weights_sd.get(name + ".lokr_w2_b")
+            if w2a is None or w2b is None:
+                continue
+            out_k, in_n = int(w2a.shape[0]), int(w2b.shape[1])
+        mods.append((in_m * in_n, out_l * out_k, in_m, in_n, out_l, out_k))
+    candidates = set()
+    for (_, _, in_m, in_n, out_l, out_k) in mods:
+        candidates.update((in_m, in_n, out_l, out_k))
+    for cand in sorted(candidates):
+        if cand > 0 and all(
+            factorization(idim, cand) == (im, iN) and factorization(odim, cand) == (ol, ok)
+            for (idim, odim, im, iN, ol, ok) in mods
+        ):
+            return cand
+    return -1
+
+
 def make_kron(w1, w2, scale):
     """Compute Kronecker product of w1 and w2, scaled by scale."""
     if w1.dim() != w2.dim():
@@ -501,14 +538,14 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
 
     text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
     arch_config = detect_arch_config(unet, text_encoders)
-    # LoKr state_dict does not store `factor`, but train_network saves it in the
-    # safetensors metadata (ss_network_args). Recover it when not passed explicitly so a
-    # non-default-factor checkpoint rebuilds with the correct factorization/scale; a bare
-    # default of -1 would mis-shape lokr_w1/lokr_w2 and pick the wrong alpha/scale.
+    # LoKr state_dict does not store `factor`. Recover it (in priority order) from explicit
+    # kwargs, the safetensors metadata (ss_network_args), or — for .pt/.ckpt/--no_metadata
+    # checkpoints — by inferring it from the saved tensor shapes. A bare default of -1 would
+    # mis-shape lokr_w1/lokr_w2 and pick the wrong alpha/scale for a non-default factor.
     if "factor" in kwargs:
         factor = int(kwargs["factor"])
     else:
-        factor = -1
+        factor = None
         if file is not None and str(file).endswith(".safetensors"):
             try:
                 import json
@@ -516,10 +553,13 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
 
                 with safe_open(file, framework="pt") as f:
                     _meta = f.metadata() or {}
-                if _meta.get("ss_network_args"):
-                    factor = int(json.loads(_meta["ss_network_args"]).get("factor", -1))
+                _net_args = json.loads(_meta["ss_network_args"]) if _meta.get("ss_network_args") else {}
+                if "factor" in _net_args:
+                    factor = int(_net_args["factor"])
             except Exception:
-                factor = -1
+                factor = None
+        if factor is None:
+            factor = _infer_lokr_factor_from_weights(weights_sd)
 
     module_class = LoKrInfModule if for_inference else LoKrModule
     module_kwargs = {"factor": factor, "use_tucker": use_tucker}
