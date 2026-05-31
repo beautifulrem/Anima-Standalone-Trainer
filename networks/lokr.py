@@ -316,19 +316,32 @@ class LoKrInfModule(LoKrModule):
 
         w1 = sd["lokr_w1"].to(torch.float).to(device)
 
+        # Derive scale from the saved alpha/dim, NOT self.scale: self.scale comes from the
+        # init-time `factor` (via the full-matrix use_w2 alpha-forcing), which is unknown for
+        # .pt / --no_metadata checkpoints and would otherwise mis-scale a non-default-factor
+        # merge. Mirrors the factor-independent logic in merge_weights_to_tensor().
+        alpha = sd.get("alpha", None)
+        if alpha is not None:
+            alpha = alpha.item() if hasattr(alpha, "item") else float(alpha)
+
         if "lokr_w2" in sd:
             w2 = sd["lokr_w2"].to(torch.float).to(device)
+            scale = 1.0  # full-matrix mode
         elif "lokr_t2" in sd:
             t2 = sd["lokr_t2"].to(torch.float).to(device)
             w2a = sd["lokr_w2_a"].to(torch.float).to(device)
             w2b = sd["lokr_w2_b"].to(torch.float).to(device)
             w2 = rebuild_tucker(t2, w2a, w2b)
+            dim = w2a.shape[0]
+            scale = (alpha if alpha is not None else dim) / dim
         else:
             w2a = sd["lokr_w2_a"].to(torch.float).to(device)
             w2b = sd["lokr_w2_b"].to(torch.float).to(device)
             w2 = w2a @ w2b
+            dim = w2a.shape[1]
+            scale = (alpha if alpha is not None else dim) / dim
 
-        diff_weight = make_kron(w1, w2, self.scale)
+        diff_weight = make_kron(w1, w2, scale)
         if diff_weight.shape != weight.shape:
             diff_weight = diff_weight.reshape(weight.shape)
 
