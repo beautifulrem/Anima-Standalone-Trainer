@@ -534,7 +534,31 @@ class AdditionalNetwork(torch.nn.Module):
         else:
             weights_sd = torch.load(file, map_location="cpu")
 
-        info = self.load_state_dict(weights_sd, False)
+        try:
+            info = self.load_state_dict(weights_sd, False)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Failed to load adapter weights from {file} into the network built from the "
+                f"current config: {e}. For LoKr this is usually a factor mismatch -- the saved "
+                f"checkpoint's structure differs from the current settings. Pass --dim_from_weights "
+                f"to rebuild the network from the checkpoint, or match the settings."
+            ) from e
+        # strict=False silently drops checkpoint keys with no matching module, i.e. a partial
+        # load (e.g. the checkpoint has mod_dim / use_tucker / extra target layers the current
+        # config did not create). Refuse rather than train on a half-loaded adapter.
+        if info.unexpected_keys:
+            raise RuntimeError(
+                f"{len(info.unexpected_keys)} adapter weights in {file} have no matching module in "
+                f"the network built from the current config (e.g. {info.unexpected_keys[:3]}). Its "
+                f"structure (factor / mod_dim / use_tucker / target layers) differs from the current "
+                f"settings -- pass --dim_from_weights to rebuild from the checkpoint, or match the "
+                f"settings. Refusing a partial load."
+            )
+        if info.missing_keys:
+            logger.warning(
+                f"{len(info.missing_keys)} network modules are absent from {file} and keep their "
+                f"initial weights (e.g. {info.missing_keys[:3]})."
+            )
         return info
 
     def apply_to(self, text_encoders, unet, apply_text_encoder=True, apply_unet=True):
