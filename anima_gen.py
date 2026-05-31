@@ -84,6 +84,7 @@ def manage_lora(accelerator, models, target_path, target_mul):
             CURRENT_LORA["path"] = None
         except Exception as e:
             logger.error(f"Failed to unmerge LoRA: {e}")
+            raise
             
     # Merge new if specified
     if target_path:
@@ -94,6 +95,7 @@ def manage_lora(accelerator, models, target_path, target_mul):
             CURRENT_LORA["mul"] = target_mul
         except Exception as e:
             logger.error(f"Failed to merge LoRA: {e}")
+            raise
 
 def load_models(args, accelerator):
     weight_dtype = torch.float32
