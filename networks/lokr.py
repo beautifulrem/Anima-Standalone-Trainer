@@ -483,7 +483,25 @@ def create_network_from_weights(multiplier, file, vae, text_encoder, unet, weigh
 
     text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
     arch_config = detect_arch_config(unet, text_encoders)
-    factor = int(kwargs.get("factor", -1))
+    # LoKr state_dict does not store `factor`, but train_network saves it in the
+    # safetensors metadata (ss_network_args). Recover it when not passed explicitly so a
+    # non-default-factor checkpoint rebuilds with the correct factorization/scale; a bare
+    # default of -1 would mis-shape lokr_w1/lokr_w2 and pick the wrong alpha/scale.
+    if "factor" in kwargs:
+        factor = int(kwargs["factor"])
+    else:
+        factor = -1
+        if file is not None and str(file).endswith(".safetensors"):
+            try:
+                import json
+                from safetensors import safe_open
+
+                with safe_open(file, framework="pt") as f:
+                    _meta = f.metadata() or {}
+                if _meta.get("ss_network_args"):
+                    factor = int(json.loads(_meta["ss_network_args"]).get("factor", -1))
+            except Exception:
+                factor = -1
 
     module_class = LoKrInfModule if for_inference else LoKrModule
     module_kwargs = {"factor": factor, "use_tucker": use_tucker}
