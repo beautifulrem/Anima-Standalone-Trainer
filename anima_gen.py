@@ -37,6 +37,19 @@ def _assert_supported_network_module(lora_path):
         )
 
 
+def _assert_adapters_loaded(net, lora_path):
+    """Universal catch for formats _assert_supported_network_module cannot see (no
+    .safetensors metadata, e.g. .ckpt/.pt): a LoHa/LoKr checkpoint has no lora_down keys,
+    so lora_anima builds an empty adapter set and merge becomes a no-op -> silent
+    base-model output. Fail loud instead."""
+    if not net.unet_loras and not net.text_encoder_loras:
+        raise ValueError(
+            f"0 adapters loaded from {lora_path}: checkpoint keys do not match "
+            "networks.lora_anima (likely a LoHa/LoKr .ckpt/.pt). anima_gen would "
+            "otherwise silently produce base-model output. Aborting."
+        )
+
+
 def _apply_lora(accelerator, models, lora_path, multiplier):
     _assert_supported_network_module(lora_path)
     import networks.lora_anima
@@ -48,6 +61,7 @@ def _apply_lora(accelerator, models, lora_path, multiplier):
         unet=models["dit"],
         for_inference=True
     )
+    _assert_adapters_loaded(net, lora_path)
     net.merge_to([models["qwen3"]], models["dit"], sd, models["dtype"], accelerator.device)
     del net
 
@@ -148,6 +162,7 @@ def load_models(args, accelerator):
             for_inference=True
         )
         
+        _assert_adapters_loaded(network, args.network_weights)
         network.merge_to([qwen3_text_encoder], dit, weights_sd, weight_dtype, "cpu")
         logger.info(f"LoRA merged with multiplier {args.network_mul}")
         
