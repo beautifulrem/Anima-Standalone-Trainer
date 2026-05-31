@@ -17,7 +17,28 @@ CACHED_MODELS = None
 APP_ACCELERATOR = None
 CURRENT_LORA = {"path": None, "mul": 1.0}
 
+def _assert_supported_network_module(lora_path):
+    """anima_gen only wires up networks.lora_anima. A LoHa/LoKr checkpoint parses to 0
+    adapters here and would merge as a no-op -> silent base-model output. Read the trained
+    module from safetensors metadata and fail loud on a mismatch."""
+    if not lora_path or not str(lora_path).endswith(".safetensors"):
+        return
+    try:
+        from safetensors import safe_open
+        with safe_open(lora_path, framework="pt") as f:
+            mod = (f.metadata() or {}).get("ss_network_module")
+    except Exception:
+        return
+    if mod and mod != "networks.lora_anima":
+        raise ValueError(
+            f"Checkpoint {lora_path} was trained with {mod}, but anima_gen supports "
+            "only networks.lora_anima. LoHa/LoKr generation is not yet wired up; "
+            "aborting instead of silently producing base-model output."
+        )
+
+
 def _apply_lora(accelerator, models, lora_path, multiplier):
+    _assert_supported_network_module(lora_path)
     import networks.lora_anima
     net, sd = networks.lora_anima.create_network_from_weights(
         multiplier=multiplier,
@@ -114,6 +135,7 @@ def load_models(args, accelerator):
     if args.network_weights:
         # Initial LoRA load 
         logger.info(f"Loading LoRA weights from {args.network_weights}")
+        _assert_supported_network_module(args.network_weights)
         import networks.lora_anima
         network, weights_sd = networks.lora_anima.create_network_from_weights(
             multiplier=args.network_mul,
