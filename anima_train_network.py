@@ -11,7 +11,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from library import anima_models, anima_train_utils, anima_utils, strategy_anima, strategy_base, train_util
+from library import anima_38b_connector, anima_models, anima_train_utils, anima_utils, strategy_anima, strategy_base, train_util
 import train_network
 from library.utils import setup_logging
 
@@ -52,6 +52,15 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
         val_dataset_group: Optional[train_util.DatasetGroup],
     ):
+        if not self.get_dit_load_kwargs(args).get("load_semantic_connector") and (
+            anima_38b_connector.is_anima_38b_checkpoint(args.dit_path)
+        ):
+            # Also catches the original (unbundled) Anima-3.8B.safetensors, which would otherwise
+            # train without the Qwen3.5 semantic stream that inference uses.
+            raise ValueError(
+                f"{os.path.basename(args.dit_path)} is an Anima 3.8B checkpoint: use anima_38b_train_network.py "
+                "(with --qwen35_path) for LoRA training."
+            )
         if args.cache_text_encoder_outputs_to_disk and not args.cache_text_encoder_outputs:
             logger.warning(
                 "cache_text_encoder_outputs_to_disk is enabled, so cache_text_encoder_outputs is also enabled"

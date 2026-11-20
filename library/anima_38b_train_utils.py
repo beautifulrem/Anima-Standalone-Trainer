@@ -23,12 +23,15 @@ logger = logging.getLogger(__name__)
 QWEN35_COMPUTE_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
 
 
-def add_anima_38b_arguments(parser: argparse.ArgumentParser, qwen35_required: bool = False) -> None:
-    """Arguments for Anima 3.8B (Qwen3.5 semantic connector)."""
+def add_anima_38b_arguments(parser: argparse.ArgumentParser) -> None:
+    """Arguments for Anima 3.8B (Qwen3.5 semantic connector).
+
+    None is required at parse time: values may come from --config_file, which is read
+    after parsing. validate_anima_38b_args checks them.
+    """
     parser.add_argument(
         "--qwen35_path",
         type=str,
-        required=qwen35_required,
         default=None,
         help="Anima 3.8B only: path to the Qwen3.5 4B text encoder (text_encoders/qwen35_4b.safetensors)",
     )

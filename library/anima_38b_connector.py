@@ -769,7 +769,7 @@ def semantic_layer_indices_for(dit_path: str, semantic_connector_path: str | Non
 
 def is_anima_38b_checkpoint(path: str | None) -> bool:
     """True for Anima 3.8B DiT checkpoints (bundled connector or 52 blocks)."""
-    if not path or not path.endswith(".safetensors"):
+    if not path or not path.lower().endswith(".safetensors"):
         return False
     from safetensors import safe_open
 

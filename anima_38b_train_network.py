@@ -218,7 +218,7 @@ class Anima38BNetworkTrainer(AnimaNetworkTrainer):
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = setup_anima_parser()
-    anima_38b_train_utils.add_anima_38b_arguments(parser, qwen35_required=True)
+    anima_38b_train_utils.add_anima_38b_arguments(parser)
     return parser
 
 
