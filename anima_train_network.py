@@ -21,6 +21,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _index_dit_kwargs(kwargs: dict, indices) -> dict:
+    """Select batch rows from extra DiT kwargs (tensors or lists of tensors)."""
+    selected = {}
+    for key, value in kwargs.items():
+        if isinstance(value, (list, tuple)):
+            selected[key] = [v[indices] for v in value]
+        elif isinstance(value, torch.Tensor):
+            selected[key] = value[indices]
+        else:
+            selected[key] = value
+    return selected
+
+
 class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -128,6 +141,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             transformer_dtype=transformer_dtype,
             llm_adapter_path=getattr(args, 'llm_adapter_path', None),
             disable_mmap=getattr(args, 'disable_mmap_load_safetensors', False),
+            **self.get_dit_load_kwargs(args),
         )
 
         # Attention backend
@@ -151,6 +165,14 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # Return format: (model_type, text_encoders, vae, unet)
         return "anima", [self.qwen3_text_encoder], self.vae, dit
+
+    def get_dit_load_kwargs(self, args) -> dict:
+        """Extra keyword arguments for anima_utils.load_anima_dit (overridden for Anima 3.8B)."""
+        return {}
+
+    def get_extra_dit_kwargs(self, text_encoder_conds, accelerator, weight_dtype) -> dict:
+        """Extra DiT forward kwargs built from text-encoder outputs beyond the native four."""
+        return {}
 
     def get_tokenize_strategy(self, args):
         # Load tokenizers from paths (called before load_target_model, so self.qwen3_tokenizer isn't set yet)
@@ -333,8 +355,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 if t is not None and t.dtype.is_floating_point:
                     t.requires_grad_(True)
 
-        # Unpack text encoder conditions
-        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_conds
+        # Unpack text encoder conditions (Anima 3.8B appends Qwen3.5 states after the native four)
+        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_conds[:4]
+        extra_dit_kwargs = self.get_extra_dit_kwargs(text_encoder_conds, accelerator, weight_dtype)
 
         # Move to device
         prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
@@ -365,6 +388,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 source_attention_mask=attn_mask,
                 t5_input_ids=t5_input_ids,
                 t5_attn_mask=t5_attn_mask,
+                **extra_dit_kwargs,
             )
 
         # Rectified flow target: noise - latents
@@ -395,6 +419,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                         source_attention_mask=attn_mask[diff_output_pr_indices],
                         t5_input_ids=t5_input_ids[diff_output_pr_indices],
                         t5_attn_mask=t5_attn_mask[diff_output_pr_indices],
+                        **_index_dit_kwargs(extra_dit_kwargs, diff_output_pr_indices),
                     )
                 network.set_multiplier(1.0)
 

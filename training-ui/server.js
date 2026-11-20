@@ -50,6 +50,42 @@ function getArchForJob(jobConfig) {
     return { id: defaultId, ...ARCH_REGISTRY.architectures[defaultId] };
 }
 
+// --- Anima 3.8B detection ---
+// Anima 3.8B (lylogummy/Anima-3.8B) has 52 DiT blocks and, in v1.1, bundles its
+// Qwen3.5 semantic connector. It trains with anima_38b_train_network.py.
+const ANIMA_38B_BUNDLE_ARCHITECTURE = 'anima_3_8b_semantic_connector_v2_bundle';
+const ANIMA_38B_ONLY_MODEL_ARGS = ['qwen35_path', 'semantic_connector'];
+
+function readSafetensorsHeader(filePath) {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+        const lenBuf = Buffer.alloc(8);
+        fs.readSync(fd, lenBuf, 0, 8, 0);
+        const headerLen = Number(lenBuf.readBigUInt64LE(0));
+        if (!Number.isFinite(headerLen) || headerLen <= 0 || headerLen > 100 * 1024 * 1024) {
+            throw new Error(`invalid safetensors header length ${headerLen}`);
+        }
+        const headerBuf = Buffer.alloc(headerLen);
+        fs.readSync(fd, headerBuf, 0, headerLen, 8);
+        return JSON.parse(headerBuf.toString('utf8'));
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+function isAnima38BCheckpoint(ditPath) {
+    if (!ditPath || !ditPath.toLowerCase().endsWith('.safetensors') || !fs.existsSync(ditPath)) return false;
+    try {
+        const header = readSafetensorsHeader(ditPath);
+        const meta = header.__metadata__ || {};
+        if (meta.architecture === ANIMA_38B_BUNDLE_ARCHITECTURE || meta.new_block_count === '52') return true;
+        return Object.keys(header).some((key) => /(^|\.)blocks\.51\./.test(key));
+    } catch (err) {
+        console.warn(`[Anima 3.8B] Could not read ${ditPath}: ${err.message}`);
+        return false;
+    }
+}
+
 // Build model_arguments from registry + global config for a given architecture
 function buildModelArgs(arch, globalConfig) {
     const modelArgs = {};
@@ -1480,6 +1516,29 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         // Build merged config and write to temp file
         const mergedConfig = buildTrainingConfig(jobName, jobPath);
 
+        // Anima 3.8B: detected from the DiT checkpoint, trained by a dedicated LoRA script.
+        const preArch = getArchForJob(mergedConfig);
+        const modelArgs = mergedConfig.model_arguments || {};
+        const isAnima38B = preArch.id === 'anima' && isAnima38BCheckpoint(modelArgs.dit_path);
+        if (isAnima38B) {
+            const preMode = mergedConfig.training_arguments?.multigpu_mode
+                || (mergedConfig.training_arguments?.deepspeed ? 'deepspeed' : (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp'));
+            if (!mergedConfig.network_arguments?.network_module) {
+                return res.status(400).json({ error: 'Anima 3.8B currently supports LoRA/LyCORIS training only (full finetuning is not implemented).' });
+            }
+            if (preMode === 'tp_sp') {
+                return res.status(400).json({ error: 'TP/SP is not supported for Anima 3.8B. Use DDP or a single GPU.' });
+            }
+            if (!modelArgs.qwen35_path) {
+                return res.status(400).json({ error: 'Anima 3.8B needs the Qwen3.5 4B text encoder (qwen35_4b.safetensors). Set it in Global Settings.' });
+            }
+            mergedConfig.network_arguments.network_train_unet_only = true;
+            if (!modelArgs.semantic_connector) delete modelArgs.semantic_connector;
+            console.log('[Anima 3.8B] Detected Anima 3.8B checkpoint, using anima_38b_train_network.py');
+        } else {
+            for (const key of ANIMA_38B_ONLY_MODEL_ARGS) delete modelArgs[key];
+        }
+
         // TP/SP: strip options that are incompatible with the TP training script.
         const launchMode = mergedConfig.training_arguments?.multigpu_mode
             || (mergedConfig.training_arguments?.deepspeed ? 'deepspeed' : (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp'));
@@ -1583,6 +1642,9 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             trainCmd = tpTrainCmd;
         } else {
             let scriptName = hasNetwork ? jobArch.scripts.train_network : jobArch.scripts.train;
+            if (isAnima38B && jobArch.scripts.train_network_38b) {
+                scriptName = jobArch.scripts.train_network_38b;
+            }
             if (scriptName === 'anima_train.py' && mergedConfig.training_arguments?.use_muon) {
                 scriptName = 'anima_train_muon.py';
             }

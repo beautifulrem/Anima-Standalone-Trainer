@@ -5,6 +5,9 @@ venv_path = ""
 dit_path = ""
 qwen3_path = ""
 vae_path = ""
+# Anima 3.8B only (Qwen3.5 semantic stream)
+qwen35_path = ""
+semantic_connector_path = ""
 
 # Lumina Paths
 lumina_dit_path = ""

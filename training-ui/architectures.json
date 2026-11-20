@@ -8,7 +8,8 @@
         "train_network": "anima_train_network.py",
         "train_tp_sp": "anima_train_tensor_sequence_parallel.py",
         "train_network_tp_sp": "anima_train_network_tensor_sequence_parallel.py",
-        "generate": "anima_gen.py"
+        "generate": "anima_gen.py",
+        "train_network_38b": "anima_38b_train_network.py"
       },
       "global_paths": {
         "dit_path": {
@@ -25,6 +26,16 @@
           "label": "VAE Path",
           "placeholder": "C:\\Anima\\split_files\\vae\\qwen_image_vae.safetensors",
           "cli_flag": "vae_path"
+        },
+        "qwen35_path": {
+          "label": "Qwen3.5 4B Text Encoder Path (Anima 3.8B only)",
+          "placeholder": "C:\\Anima-3.8B\\text_encoders\\qwen35_4b.safetensors",
+          "cli_flag": "qwen35_path"
+        },
+        "semantic_connector_path": {
+          "label": "Semantic Connector Path (optional, Anima 3.8B without bundled connector)",
+          "placeholder": "C:\\Anima-3.8B\\text_encoders\\Anima-3.8B-expanded_adapter.safetensors",
+          "cli_flag": "semantic_connector"
         }
       },
       "gen_params": {

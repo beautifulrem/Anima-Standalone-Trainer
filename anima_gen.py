@@ -6,6 +6,7 @@ import torch
 import threading
 from accelerate import Accelerator
 from library import anima_utils, strategy_anima, anima_train_utils, train_util
+from library import anima_38b_connector, anima_qwen35, strategy_anima_38b
 from library.utils import setup_logging
 
 setup_logging()
@@ -95,13 +96,27 @@ def load_models(args, accelerator):
          dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
          transformer_dtype = dtype_map.get(args.transformer_dtype, None)
 
+    # Anima 3.8B: attach the Qwen3.5 semantic connector when a Qwen3.5 encoder is given
+    is_38b = anima_38b_connector.is_anima_38b_checkpoint(args.dit_path)
+    use_38b = is_38b and bool(args.qwen35_path)
+    if is_38b and not use_38b:
+        logger.warning("Anima 3.8B checkpoint without --qwen35_path: generating with the native Qwen3 adapter only.")
+
     dit = anima_utils.load_anima_dit(
         args.dit_path,
         dtype=weight_dtype,
         device="cpu",
         transformer_dtype=transformer_dtype,
+        load_semantic_connector=use_38b,
+        semantic_connector_path=args.semantic_connector or None,
     )
     dit.eval()
+
+    qwen35_text_encoder = None
+    if use_38b:
+        qwen35_text_encoder = anima_qwen35.load_qwen35_text_encoder(
+            args.qwen35_path, device="cpu", compute_dtype=getattr(torch, args.qwen35_compute_dtype)
+        )
     
     # Load VAE
     logger.info(f"Loading VAE from {args.vae_path}")
@@ -145,6 +160,8 @@ def load_models(args, accelerator):
         logger.info("  Secondary model (deepcopy) on GPU 1")
         
         qwen3_text_encoder.to(torch.device('cuda:0'))
+        if qwen35_text_encoder is not None:
+            anima_qwen35.move_qwen35_text_encoder(qwen35_text_encoder, torch.device('cuda:0'))
         vae.to(torch.device('cuda:0'))
         vae_scale = [t.to(torch.device('cuda:0')) for t in vae_scale]
     elif args.device_map == 'sharding' and torch.cuda.device_count() > 1:
@@ -187,6 +204,8 @@ def load_models(args, accelerator):
             dit.extra_pos_embedder.to(first_gpu)
         if hasattr(dit, 'llm_adapter'):
             dit.llm_adapter.to(first_gpu)
+        if hasattr(dit, 'anima_v2_connector'):
+            dit.anima_v2_connector.to(first_gpu)
         dit.final_layer.to(last_gpu)
         
         # Distribute blocks across GPUs
@@ -204,11 +223,15 @@ def load_models(args, accelerator):
 
         # Text encoder on first GPU, VAE on last GPU
         qwen3_text_encoder.to(first_gpu)
+        if qwen35_text_encoder is not None:
+            anima_qwen35.move_qwen35_text_encoder(qwen35_text_encoder, first_gpu)
         vae.to(last_gpu)
         vae_scale = [t.to(last_gpu) for t in vae_scale]
     else:
         dit.to(accelerator.device)
         qwen3_text_encoder.to(accelerator.device)
+        if qwen35_text_encoder is not None:
+            anima_qwen35.move_qwen35_text_encoder(qwen35_text_encoder, accelerator.device)
         vae.to(accelerator.device)
         vae_scale = [t.to(accelerator.device) for t in vae_scale]
 
@@ -224,17 +247,34 @@ def load_models(args, accelerator):
         if dit_secondary is not None:
             dit_secondary.set_sage_attn(True)
 
+    if qwen35_text_encoder is not None:
+        tokenize_strategy = strategy_anima_38b.Anima38BTokenizeStrategy(
+            qwen3_path=args.qwen3_path,
+            qwen3_max_length=args.qwen3_max_token_length,
+            qwen35_tokenizer_path=args.qwen35_tokenizer_path,
+            qwen35_max_length=args.qwen35_max_token_length,
+        )
+        text_encoding_strategy = strategy_anima_38b.Anima38BTextEncodingStrategy(
+            dit.anima_v2_connector.layer_indices
+        )
+        text_encoders = [qwen3_text_encoder, qwen35_text_encoder]
+    else:
+        tokenize_strategy = strategy_anima.AnimaTokenizeStrategy(
+            qwen3_path=args.qwen3_path,
+            qwen3_max_length=args.qwen3_max_token_length,
+        )
+        text_encoding_strategy = strategy_anima.AnimaTextEncodingStrategy()
+        text_encoders = qwen3_text_encoder
+
     return {
         "dit": dit,
         "dit_secondary": dit_secondary,
         "qwen3": qwen3_text_encoder,
+        "text_encoders": text_encoders,
         "vae": vae,
         "vae_scale": vae_scale,
-        "tokenize_strategy": strategy_anima.AnimaTokenizeStrategy(
-            qwen3_path=args.qwen3_path,
-            qwen3_max_length=args.qwen3_max_token_length,
-        ),
-        "text_encoding_strategy": strategy_anima.AnimaTextEncodingStrategy(),
+        "tokenize_strategy": tokenize_strategy,
+        "text_encoding_strategy": text_encoding_strategy,
         "dtype": weight_dtype
     }
 
@@ -249,7 +289,7 @@ def perform_generation(args, models, accelerator):
         models["dit"], 
         models["vae"], 
         models["vae_scale"],
-        models["qwen3"], 
+        models.get("text_encoders", models["qwen3"]),
         models["tokenize_strategy"], 
         models["text_encoding_strategy"],
         dit_secondary=models.get("dit_secondary"),
@@ -351,6 +391,13 @@ def main():
     
     parser.add_argument("--sage_attn", action="store_true", help="Use SageAttention for inference (requires sageattention package)")
     parser.add_argument("--server_port", type=int, default=None, help="Run in server mode on this port")
+
+    # Anima 3.8B (ignored unless --dit_path is an Anima 3.8B checkpoint)
+    parser.add_argument("--qwen35_path", type=str, default=None, help="Anima 3.8B Qwen3.5 4B text encoder (qwen35_4b.safetensors)")
+    parser.add_argument("--qwen35_tokenizer_path", type=str, default=None, help="Qwen3.5 tokenizer (default: bundled configs/qwen35_4b)")
+    parser.add_argument("--qwen35_max_token_length", type=int, default=1024)
+    parser.add_argument("--qwen35_compute_dtype", type=str, default="float32", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--semantic_connector", type=str, default=None, help="Standalone Anima 3.8B semantic connector (not needed for v1.1)")
 
     args = parser.parse_args()
     

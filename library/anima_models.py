@@ -1436,6 +1436,60 @@ class MiniTrainDIT(nn.Module):
             return
         self.offloader.prepare_block_devices_before_forward(self.blocks)
 
+    def compute_crossattn_emb(
+        self,
+        crossattn_emb: torch.Tensor,
+        timesteps: Optional[torch.Tensor] = None,
+        source_attention_mask: Optional[torch.Tensor] = None,
+        t5_input_ids: Optional[torch.Tensor] = None,
+        t5_attn_mask: Optional[torch.Tensor] = None,
+        semantic_hidden_states: Optional[List[torch.Tensor]] = None,
+        semantic_attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Map text-encoder outputs to DiT cross-attention context.
+
+        Uses the native LLM adapter, or the Anima 3.8B semantic connector
+        (``self.anima_v2_connector``) when Qwen3.5 hidden states are given. The
+        v2 connector depends on the diffusion timestep, so it runs every step.
+        """
+        if t5_input_ids is None or not self.use_llm_adapter or not hasattr(self, 'llm_adapter'):
+            return crossattn_emb
+
+        connector = getattr(self, 'anima_v2_connector', None)
+        if connector is not None and semantic_hidden_states is not None:
+            connector_timesteps = None
+            if timesteps is not None:
+                connector_timesteps = timesteps.reshape(timesteps.shape[0], -1)[:, 0]
+            # The frozen connector only needs autograd when LoRA patches the
+            # native adapter it reuses (train_llm_adapter) or it is trained itself.
+            grad_enabled = torch.is_grad_enabled() and getattr(self, 'semantic_connector_grad', True)
+            with torch.set_grad_enabled(grad_enabled):
+                crossattn_emb = connector(
+                    native_source=crossattn_emb,
+                    target_input_ids=t5_input_ids,
+                    semantic_hidden_states=semantic_hidden_states,
+                    target_attention_mask=t5_attn_mask,
+                    native_source_mask=source_attention_mask,
+                    semantic_source_mask=semantic_attention_mask,
+                    timesteps=connector_timesteps,
+                )
+        else:
+            if connector is not None and not getattr(self, '_warned_missing_semantic_states', False):
+                logger.warning(
+                    "Anima 3.8B semantic connector is loaded but no Qwen3.5 states were given; "
+                    "falling back to the native LLM adapter only."
+                )
+                self._warned_missing_semantic_states = True
+            crossattn_emb = self.llm_adapter(
+                source_hidden_states=crossattn_emb,
+                target_input_ids=t5_input_ids,
+                target_attention_mask=t5_attn_mask,
+                source_attention_mask=source_attention_mask,
+            )
+        if t5_attn_mask is not None:
+            crossattn_emb[~t5_attn_mask.bool()] = 0
+        return crossattn_emb
+
     def forward(
         self,
         x_B_C_T_H_W: torch.Tensor,
@@ -1446,6 +1500,8 @@ class MiniTrainDIT(nn.Module):
         source_attention_mask: Optional[torch.Tensor] = None,
         t5_input_ids: Optional[torch.Tensor] = None,
         t5_attn_mask: Optional[torch.Tensor] = None,
+        semantic_hidden_states: Optional[List[torch.Tensor]] = None,
+        semantic_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -1457,17 +1513,19 @@ class MiniTrainDIT(nn.Module):
             source_attention_mask: Optional attention mask for Qwen3 embeddings (used with LLM adapter)
             t5_input_ids: Optional T5 token IDs (triggers LLM adapter when provided)
             t5_attn_mask: Optional T5 attention mask
+            semantic_hidden_states: Optional Qwen3.5 hidden states (Anima 3.8B semantic connector)
+            semantic_attention_mask: Optional mask for the Qwen3.5 hidden states
         """
         # Run LLM adapter inside forward for correct DDP gradient synchronization
-        if t5_input_ids is not None and self.use_llm_adapter and hasattr(self, 'llm_adapter'):
-            crossattn_emb = self.llm_adapter(
-                source_hidden_states=crossattn_emb,
-                target_input_ids=t5_input_ids,
-                target_attention_mask=t5_attn_mask,
-                source_attention_mask=source_attention_mask,
-            )
-            if t5_attn_mask is not None:
-                crossattn_emb[~t5_attn_mask.bool()] = 0
+        crossattn_emb = self.compute_crossattn_emb(
+            crossattn_emb,
+            timesteps_B_T,
+            source_attention_mask=source_attention_mask,
+            t5_input_ids=t5_input_ids,
+            t5_attn_mask=t5_attn_mask,
+            semantic_hidden_states=semantic_hidden_states,
+            semantic_attention_mask=semantic_attention_mask,
+        )
 
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb = self.prepare_embedded_sequence(
             x_B_C_T_H_W,

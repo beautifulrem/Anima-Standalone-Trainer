@@ -4,7 +4,7 @@ import argparse
 import math
 import os
 import time
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import torch
@@ -396,18 +396,26 @@ def save_anima_model_on_epoch_end_or_stepwise(
     )
 
 
+# Conditioning is either a fixed tensor or a function of the timestep (Anima 3.8B v2 connector)
+CrossAttnCond = Union[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]
+
+
+def _cond_at(cond: CrossAttnCond, t: torch.Tensor) -> torch.Tensor:
+    return cond(t) if callable(cond) else cond
+
+
 # Sampling (Euler discrete for rectified flow)
 def do_sample(
     height: int,
     width: int,
     seed: Optional[int],
     dit: anima_models.MiniTrainDIT,
-    crossattn_emb: torch.Tensor,
+    crossattn_emb: CrossAttnCond,
     steps: int,
     dtype: torch.dtype,
     device: torch.device,
     guidance_scale: float = 1.0,
-    neg_crossattn_emb: Optional[torch.Tensor] = None,
+    neg_crossattn_emb: Optional[CrossAttnCond] = None,
     dit_secondary: Optional[anima_models.MiniTrainDIT] = None,
 ) -> torch.Tensor:
     """Generate a sample using Euler discrete sampling for rectified flow.
@@ -416,7 +424,8 @@ def do_sample(
         height, width: Output image dimensions
         seed: Random seed (None for random)
         dit: MiniTrainDIT model
-        crossattn_emb: Cross-attention embeddings (B, N, D)
+        crossattn_emb: Cross-attention embeddings (B, N, D), or a callable ``f(t) -> (B, N, D)``
+            for timestep-dependent conditioning (Anima 3.8B semantic connector v2)
         steps: Number of sampling steps
         dtype: Compute dtype
         device: Compute device
@@ -454,13 +463,17 @@ def do_sample(
     padding_mask = torch.zeros(1, 1, latent_h, latent_w, dtype=dtype, device=device)
 
     use_cfg = guidance_scale > 1.0 and neg_crossattn_emb is not None
+    dynamic_cond = callable(crossattn_emb) or callable(neg_crossattn_emb)
+    if dynamic_cond and dit_secondary is not None:
+        logger.info("Timestep-dependent conditioning: parallel CFG disabled for this sample")
+        dit_secondary = None
     use_parallel_cfg = use_cfg and dit_secondary is not None
     has_block_swap = dit.blocks_to_swap is not None and dit.blocks_to_swap > 0
 
     # Pre-copy negative tensors to secondary GPU if using parallel CFG
     if use_parallel_cfg:
         sec_device = next(dit_secondary.parameters()).device
-        neg_crossattn_sec = neg_crossattn_emb.to(sec_device)
+        neg_crossattn_sec = cast(torch.Tensor, neg_crossattn_emb).to(sec_device)
         padding_mask_sec = padding_mask.to(sec_device)
         logger.info(f"Parallel CFG: pos on {device}, neg on {sec_device}")
 
@@ -505,7 +518,11 @@ def do_sample(
 
     # Pre-allocate constant CFG buffers
     if use_cfg and not use_parallel_cfg:
-        crossattn_doubled = torch.cat([crossattn_emb, neg_crossattn_emb], dim=0)
+        crossattn_doubled = (
+            None
+            if dynamic_cond
+            else torch.cat([cast(torch.Tensor, crossattn_emb), cast(torch.Tensor, neg_crossattn_emb)], dim=0)
+        )
         padding_doubled = torch.cat([padding_mask, padding_mask], dim=0)
         x_doubled = torch.empty(2, *x.shape[1:], device=device, dtype=dtype)
         t_doubled = torch.empty(2, device=device, dtype=dtype)
@@ -547,13 +564,20 @@ def do_sample(
                     t_doubled[0] = sigma
                     t_doubled[1] = sigma
 
-                    model_output = dit(x_doubled, t_doubled, crossattn_doubled, padding_mask=padding_doubled)
+                    step_crossattn = crossattn_doubled
+                    if step_crossattn is None:
+                        t_single = sigma.unsqueeze(0)
+                        step_crossattn = torch.cat(
+                            [_cond_at(crossattn_emb, t_single), _cond_at(cast(CrossAttnCond, neg_crossattn_emb), t_single)],
+                            dim=0,
+                        )
+                    model_output = dit(x_doubled, t_doubled, step_crossattn, padding_mask=padding_doubled)
 
                     pos_out, neg_out = model_output.chunk(2)
                     model_output = neg_out + guidance_scale * (pos_out - neg_out)
                 else:
                     t = sigma.unsqueeze(0)
-                    model_output = dit(x, t, crossattn_emb, padding_mask=padding_mask)
+                    model_output = dit(x, t, _cond_at(crossattn_emb, t), padding_mask=padding_mask)
 
                 # Euler step
                 dt = sigmas[i + 1] - sigma
@@ -619,7 +643,10 @@ def sample_images(
 
     # Unwrap models
     dit = accelerator.unwrap_model(dit)
-    if text_encoder is not None:
+    if isinstance(text_encoder, (list, tuple)):
+        # Anima 3.8B: [qwen3, qwen35]
+        text_encoder = [accelerator.unwrap_model(te) for te in text_encoder]
+    elif text_encoder is not None:
         text_encoder = accelerator.unwrap_model(text_encoder)
 
     prompts = train_util.load_prompts(args.sample_prompts)
@@ -655,6 +682,43 @@ def sample_images(
 
     # Synchronize all processes before resuming training
     accelerator.wait_for_everyone()
+
+
+def build_sample_crossattn(dit, encoded, device: torch.device) -> CrossAttnCond:
+    """Turn text-encoder outputs (tensors or cached numpy arrays) into DiT conditioning.
+
+    ``encoded`` is ``[prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask]`` for Anima, with
+    Qwen3.5 layer states and their mask appended for Anima 3.8B. Returns a tensor, or a
+    callable ``f(t)`` when the Anima 3.8B v2 connector makes the context timestep dependent.
+    """
+    dtype = dit.t_embedding_norm.weight.dtype
+    tensors = []
+    for value in encoded:
+        if isinstance(value, np.ndarray):
+            value = torch.from_numpy(value).unsqueeze(0)
+        tensors.append(value)
+    prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, *extra = tensors
+    prompt_embeds = prompt_embeds.to(device, dtype=dtype)
+    attn_mask = attn_mask.to(device)
+    t5_input_ids = t5_input_ids.to(device, dtype=torch.long)
+    t5_attn_mask = t5_attn_mask.to(device)
+
+    connector = getattr(dit, "anima_v2_connector", None)
+    if not extra or connector is None:
+        return dit.compute_crossattn_emb(prompt_embeds, None, attn_mask, t5_input_ids, t5_attn_mask)
+
+    semantic_states = [state.to(device, dtype=dtype) for state in extra[:-1]]
+    semantic_mask = extra[-1].to(device)
+
+    def conditioning(t: "torch.Tensor | None") -> torch.Tensor:
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=device.type != "cpu"):
+            return dit.compute_crossattn_emb(
+                prompt_embeds, t, attn_mask, t5_input_ids, t5_attn_mask, semantic_states, semantic_mask
+            ).to(dtype)
+
+    if getattr(connector, "requires_timesteps", False):
+        return conditioning
+    return conditioning(None)
 
 
 def _sample_image_inference(
@@ -698,7 +762,8 @@ def _sample_image_inference(
             return sample_prompts_te_outputs[prpt]
         if text_encoder is not None:
             tokens = tokenize_strategy.tokenize(prpt)
-            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, [text_encoder], tokens, enable_dropout=False)
+            models = list(text_encoder) if isinstance(text_encoder, (list, tuple)) else [text_encoder]
+            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, models, tokens, enable_dropout=False)
             return encoded
         return None
 
@@ -707,59 +772,14 @@ def _sample_image_inference(
         logger.warning("Cannot encode prompt, skipping sample")
         return
 
-    prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = encoded
-
-    # Convert to tensors if numpy
-    if isinstance(prompt_embeds, np.ndarray):
-        prompt_embeds = torch.from_numpy(prompt_embeds).unsqueeze(0)
-        attn_mask = torch.from_numpy(attn_mask).unsqueeze(0)
-        t5_input_ids = torch.from_numpy(t5_input_ids).unsqueeze(0)
-        t5_attn_mask = torch.from_numpy(t5_attn_mask).unsqueeze(0)
-
-    prompt_embeds = prompt_embeds.to(accelerator.device, dtype=dit.t_embedding_norm.weight.dtype)
-    attn_mask = attn_mask.to(accelerator.device)
-    t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
-    t5_attn_mask = t5_attn_mask.to(accelerator.device)
-
-    # Process through LLM adapter if available
-    if dit.use_llm_adapter and hasattr(dit, 'llm_adapter'):
-        crossattn_emb = dit.llm_adapter(
-            source_hidden_states=prompt_embeds,
-            target_input_ids=t5_input_ids,
-            target_attention_mask=t5_attn_mask,
-            source_attention_mask=attn_mask,
-        )
-        crossattn_emb[~t5_attn_mask.bool()] = 0
-    else:
-        crossattn_emb = prompt_embeds
+    crossattn_emb = build_sample_crossattn(dit, encoded, accelerator.device)
 
     # Encode negative prompt for CFG
     neg_crossattn_emb = None
     if scale > 1.0 and negative_prompt is not None:
         neg_encoded = encode_prompt(negative_prompt)
         if neg_encoded is not None:
-            neg_pe, neg_am, neg_t5_ids, neg_t5_am = neg_encoded
-            if isinstance(neg_pe, np.ndarray):
-                neg_pe = torch.from_numpy(neg_pe).unsqueeze(0)
-                neg_am = torch.from_numpy(neg_am).unsqueeze(0)
-                neg_t5_ids = torch.from_numpy(neg_t5_ids).unsqueeze(0)
-                neg_t5_am = torch.from_numpy(neg_t5_am).unsqueeze(0)
-
-            neg_pe = neg_pe.to(accelerator.device, dtype=dit.t_embedding_norm.weight.dtype)
-            neg_am = neg_am.to(accelerator.device)
-            neg_t5_ids = neg_t5_ids.to(accelerator.device, dtype=torch.long)
-            neg_t5_am = neg_t5_am.to(accelerator.device)
-
-            if dit.use_llm_adapter and hasattr(dit, 'llm_adapter'):
-                neg_crossattn_emb = dit.llm_adapter(
-                    source_hidden_states=neg_pe,
-                    target_input_ids=neg_t5_ids,
-                    target_attention_mask=neg_t5_am,
-                    source_attention_mask=neg_am,
-                )
-                neg_crossattn_emb[~neg_t5_am.bool()] = 0
-            else:
-                neg_crossattn_emb = neg_pe
+            neg_crossattn_emb = build_sample_crossattn(dit, neg_encoded, accelerator.device)
 
     original_blocks_to_swap = getattr(dit, "blocks_to_swap", 0)
 

@@ -36,6 +36,8 @@ def load_anima_dit(
     transformer_dtype: Optional[torch.dtype] = None,
     llm_adapter_path: Optional[str] = None,
     disable_mmap: bool = False,
+    load_semantic_connector: bool = False,
+    semantic_connector_path: Optional[str] = None,
 ) -> anima_models.MiniTrainDIT:
     """Load the MiniTrainDIT model from safetensors.
 
@@ -46,6 +48,9 @@ def load_anima_dit(
         transformer_dtype: Optional separate dtype for transformer blocks (lower precision)
         llm_adapter_path: Optional separate path for LLM adapter weights
         disable_mmap: If True, disable memory-mapped loading (reduces peak memory)
+        load_semantic_connector: Attach the Anima 3.8B Qwen3.5 semantic connector as
+            ``dit.anima_v2_connector`` (from the bundled checkpoint or ``semantic_connector_path``)
+        semantic_connector_path: Optional standalone v1/v2 semantic connector file
     """
     if transformer_dtype is None:
         transformer_dtype = dtype
@@ -72,6 +77,23 @@ def load_anima_dit(
         new_state_dict[k] = v
 
     state_dict = new_state_dict
+
+    # Anima 3.8B v1.1 bundles its Qwen3.5 semantic connector under net.anima_v2_connector.*
+    from library import anima_38b_connector
+
+    connector_state = {
+        k[len(anima_38b_connector.CONNECTOR_PREFIX):]: state_dict.pop(k)
+        for k in list(state_dict.keys())
+        if k.startswith(anima_38b_connector.CONNECTOR_PREFIX)
+    }
+    if connector_state and not load_semantic_connector:
+        logger.warning(
+            f"{os.path.basename(dit_path)} bundles an Anima 3.8B Qwen3.5 semantic connector "
+            f"({len(connector_state)} tensors). This script ignores it and trains against the native "
+            "Qwen3 adapter only, which does not match how the model is used at inference. "
+            "Use anima_38b_train_network.py for Anima 3.8B."
+        )
+        connector_state = {}
 
     # Derive config from state_dict
     dit_config = anima_models.get_dit_config(state_dict)
@@ -112,6 +134,9 @@ def load_anima_dit(
     if unexpected:
         logger.info(f"Unexpected keys in checkpoint (ignored): {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
 
+    if load_semantic_connector:
+        _attach_semantic_connector(dit, dit_path, state_dict, connector_state, semantic_connector_path)
+
     # Apply per-parameter dtype (high precision for 1D/critical, transformer_dtype for rest)
     for name, p in dit.named_parameters():
         dtype_to_use = dtype if (
@@ -122,6 +147,59 @@ def load_anima_dit(
     dit.to(device)
     logger.info(f"Loaded Anima DiT successfully. Parameters: {sum(p.numel() for p in dit.parameters()):,}")
     return dit
+
+
+def _attach_semantic_connector(
+    dit: anima_models.MiniTrainDIT,
+    dit_path: str,
+    dit_state_dict: Dict[str, torch.Tensor],
+    bundled_state: Dict[str, torch.Tensor],
+    semantic_connector_path: Optional[str],
+) -> None:
+    """Build the Anima 3.8B semantic connector and attach it as ``dit.anima_v2_connector``."""
+    from library import anima_38b_connector as connector_lib
+
+    if not getattr(dit, "use_llm_adapter", False) or not hasattr(dit, "llm_adapter"):
+        raise RuntimeError("The Anima 3.8B semantic connector needs a DiT with an LLM adapter.")
+
+    dit_metadata = connector_lib.read_safetensors_metadata(dit_path) if dit_path.endswith(".safetensors") else {}
+    if semantic_connector_path:
+        if bundled_state:
+            logger.info(f"Using {semantic_connector_path} instead of the connector bundled in {os.path.basename(dit_path)}")
+        state = load_file(semantic_connector_path, device="cpu")
+        metadata = connector_lib.read_safetensors_metadata(semantic_connector_path)
+        source = os.path.basename(semantic_connector_path)
+        expected_hash = metadata.get("frozen_native_sha256")
+    elif bundled_state:
+        state = bundled_state
+        metadata = connector_lib.bundle_connector_metadata(dit_metadata)
+        source = f"{os.path.basename(dit_path)} (bundled)"
+        expected_hash = dit_metadata.get("anima_v2_native_sha256") or metadata.get("frozen_native_sha256")
+    else:
+        raise RuntimeError(
+            f"{os.path.basename(dit_path)} has no bundled Qwen3.5 semantic connector. Use the bundled "
+            "Anima-3.8B-v1.1.safetensors, or pass --semantic_connector with a standalone v1/v2 connector "
+            "(e.g. Anima-3.8B-expanded_adapter.safetensors for the original Anima-3.8B.safetensors)."
+        )
+
+    if expected_hash:
+        native_state = {k[len("llm_adapter."):]: v for k, v in dit_state_dict.items() if k.startswith("llm_adapter.")}
+        actual_hash = connector_lib.native_adapter_hash(native_state)
+        if actual_hash != expected_hash:
+            logger.warning(
+                f"{source}: the connector was trained against a different native LLM adapter "
+                f"(expected sha256 {expected_hash[:12]}, got {actual_hash[:12]}). Check that the DiT and connector match."
+            )
+        else:
+            logger.info(f"{source}: native LLM adapter hash matches ({actual_hash[:12]})")
+
+    connector = connector_lib.build_semantic_connector(dit.llm_adapter, state, metadata)
+    dit.add_module("anima_v2_connector", connector)
+    n_params = sum(p.numel() for p in connector.parameters())
+    logger.info(
+        f"Attached Anima 3.8B semantic connector {connector.architecture} from {source}: "
+        f"{n_params:,} parameters, Qwen3.5 layers {list(connector.layer_indices)}"
+    )
 
 
 def load_anima_vae(vae_path: str, dtype: torch.dtype = torch.float32, device: str = "cpu"):

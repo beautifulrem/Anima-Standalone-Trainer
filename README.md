@@ -1,5 +1,6 @@
 [IMPORTANT]
 > ## Anima 2.9B LoRA training is supported
+> ## Anima 3.8B (Qwen3.5 semantic connector) LoRA training: see [docs/anima_38b.md](docs/anima_38b.md)
 
 # Anima Standalone Trainer
 
