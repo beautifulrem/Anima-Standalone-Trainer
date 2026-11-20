@@ -26,7 +26,7 @@ import argparse
 import os
 import sys
 import time
-from typing import Union
+from typing import Any, Union
 
 import torch
 import torch.distributed as dist
@@ -48,7 +48,9 @@ logger = logging.getLogger(__name__)
 
 # Import the base trainer - it brings in train_network.NetworkTrainer too
 import anima_train_network
+from anima_38b_train_network import Anima38BNetworkTrainer  # noqa: E402
 from anima_train_network import AnimaNetworkTrainer
+from library import anima_38b_train_utils  # noqa: E402
 
 
 def _ceil_to_multiple(size: int, multiple: int) -> int:
@@ -212,6 +214,8 @@ def fuse_qkv_for_tp_lora(model: torch.nn.Module, *, include_llm_adapter: bool = 
 
     fused_count = 0
     for name, module in model.named_modules():
+        if name.startswith("anima_v2_connector."):
+            continue  # Anima 3.8B connector: replicated (not sharded); keep its checkpoint layout
         if isinstance(module, Attention):
             fused_count += int(_fuse_main_attention(module))
         elif include_llm_adapter and isinstance(module, LLMAdapterAttention):
@@ -439,8 +443,8 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
 
     def __init__(self):
         super().__init__()
-        self.tp_config = None
-        self.tp_groups = None
+        self.tp_config: Any = None  # set by __main__ before train()
+        self.tp_groups: Any = None
         self.tp_active = False
         self.use_sp = False
         self._tp_step = 0
@@ -1022,11 +1026,12 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
 
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
         te = self.get_models_for_text_encoding(args, accelerator, text_encoders)
-        qwen3_te = te[0] if te is not None else None
+        if te is not None and any(t is None for t in te):
+            te = None
+        # Anima: [qwen3]; Anima 3.8B: [qwen3, qwen35] (both needed to encode a prompt)
+        sample_te = None if te is None else [accelerator.unwrap_model(t) for t in te]
 
         dit = accelerator.unwrap_model(unet)
-        if qwen3_te is not None:
-            qwen3_te = accelerator.unwrap_model(qwen3_te)
         sample_dtype = next(dit.parameters()).dtype
 
         prompts = train_util.load_prompts(args.sample_prompts)
@@ -1060,7 +1065,7 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
                     # ALL ranks run forward (TP collectives need all ranks)
                     # Only rank 0 saves the image file
                     _sample_image_inference(
-                        accelerator, args, dit, qwen3_te, vae, vae_scale_gpu,
+                        accelerator, args, dit, sample_te, vae, vae_scale_gpu,
                         self.tokenize_strategy, self.text_encoding_strategy,
                         save_dir, prompt_dict, epoch, global_step,
                         self.sample_prompts_te_outputs, None,
@@ -1113,6 +1118,15 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             )
 
 
+# MRO: the TP loader shards what the Anima 3.8B loader (connector + Qwen3.5) returns.
+class Anima38BNetworkTrainerTPSP(AnimaNetworkTrainerTPSP, Anima38BNetworkTrainer):  # pyright: ignore[reportIncompatibleMethodOverride]
+    """TP/SP LoRA trainer for Anima 3.8B.
+
+    The DiT blocks and native LLM adapter are sharded as for Anima; the semantic
+    connector (and Qwen3.5) are replicated on every rank and see the same batch.
+    """
+
+
 # ---------------------------------------------------------------------------
 #  Parser
 # ---------------------------------------------------------------------------
@@ -1120,6 +1134,7 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
 def setup_parser() -> argparse.ArgumentParser:
     # Start with ALL regular LoRA training args (inherits train_network + anima)
     parser = anima_train_network.setup_parser()
+    anima_38b_train_utils.add_anima_38b_arguments(parser)  # used when --dit_path is Anima 3.8B
 
     # TP/SP-specific args. This script intentionally runs TP+SP together.
     parser.add_argument(
@@ -1272,7 +1287,12 @@ if __name__ == "__main__":
     train_util.prepare_accelerator = _tp_prepare_accelerator
 
     # Create trainer and inject TP state
-    trainer = AnimaNetworkTrainerTPSP()
+    trainer: AnimaNetworkTrainerTPSP
+    if anima_38b_train_utils.is_anima_38b_run(args):
+        logger.info("Anima 3.8B checkpoint detected: training with the Qwen3.5 semantic connector")
+        trainer = Anima38BNetworkTrainerTPSP()
+    else:
+        trainer = AnimaNetworkTrainerTPSP()
     trainer.tp_config = tp_config
     trainer.tp_groups = tp_groups
     trainer.use_sp = use_sp

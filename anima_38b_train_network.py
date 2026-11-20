@@ -8,9 +8,10 @@
 #   Qwen3 0.6B  ──► native LLM adapter ─┐
 #   Qwen3.5 4B layers 7/15/23/31 ───────┴─► semantic connector (v2: per timestep) ──► DiT
 #
-# The connector and both text encoders stay frozen; only the network (LoRA,
-# LoHa, ...) on the DiT is trained, optionally including the native adapter
-# blocks the connector reuses (network_args train_llm_adapter=True).
+# The connector and Qwen3.5 stay frozen. The network (LoRA, LoHa, ...) trains
+# the DiT, optionally the native adapter blocks the connector reuses
+# (network_args train_llm_adapter=True) and, like regular Anima, the Qwen3 0.6B
+# text encoder (without --network_train_unet_only; needs uncached TE outputs).
 
 import argparse
 import json
@@ -25,13 +26,11 @@ init_ipex()
 
 from anima_train_network import AnimaNetworkTrainer  # noqa: E402
 from anima_train_network import setup_parser as setup_anima_parser  # noqa: E402
-from library import anima_qwen35, strategy_anima_38b, train_util  # noqa: E402
+from library import anima_38b_train_utils, strategy_anima_38b, train_util  # noqa: E402
 from library.utils import setup_logging  # noqa: E402
 
 setup_logging()
 logger = logging.getLogger(__name__)
-
-_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
 
 
 class Anima38BNetworkTrainer(AnimaNetworkTrainer):
@@ -44,16 +43,10 @@ class Anima38BNetworkTrainer(AnimaNetworkTrainer):
     # ------------------------------------------------------------------ args
     def assert_extra_args(self, args, train_dataset_group, val_dataset_group):
         super().assert_extra_args(args, train_dataset_group, val_dataset_group)
+        anima_38b_train_utils.validate_anima_38b_args(args)
         if not args.network_train_unet_only:
-            raise ValueError(
-                "Anima 3.8B: training the text encoders is not supported; add --network_train_unet_only "
-                "(use network_args train_llm_adapter=True to also train the native LLM adapter)."
-            )
-        if args.weighted_captions:
-            raise ValueError("Anima 3.8B: --weighted_captions is not supported")
-        if not 1 <= args.qwen35_max_token_length <= 4096:
-            raise ValueError("--qwen35_max_token_length must be between 1 and 4096")
-        if not args.cache_text_encoder_outputs:
+            logger.info("Anima 3.8B: training a network on the Qwen3 0.6B text encoder too (Qwen3.5 stays frozen)")
+        elif not args.cache_text_encoder_outputs:
             logger.warning(
                 "Anima 3.8B without --cache_text_encoder_outputs keeps the Qwen3.5 4B encoder on the GPU "
                 "(~4.5 GB FP8) and runs it every step. Caching is strongly recommended."
@@ -75,11 +68,7 @@ class Anima38BNetworkTrainer(AnimaNetworkTrainer):
             logger.warning(f"Anima 3.8B normally has 52 DiT blocks; this checkpoint has {dit.num_blocks}")
 
         logger.info("Loading Qwen3.5 4B text encoder...")
-        self.qwen35_text_encoder = anima_qwen35.load_qwen35_text_encoder(
-            args.qwen35_path,
-            device="cpu",
-            compute_dtype=_DTYPES[args.qwen35_compute_dtype],
-        )
+        self.qwen35_text_encoder = anima_38b_train_utils.load_qwen35_text_encoder(args)
         return model_type, [text_encoders[0], self.qwen35_text_encoder], vae, dit
 
     def get_tokenize_strategy(self, args):
@@ -119,21 +108,23 @@ class Anima38BNetworkTrainer(AnimaNetworkTrainer):
         )
 
     def get_text_encoders_train_flags(self, args, text_encoders):
-        return [False] * len(text_encoders)
+        # Only Qwen3 0.6B can be trained; Qwen3.5 is always frozen.
+        return [self.is_train_text_encoder(args)] + [False] * (len(text_encoders) - 1)
 
     def cast_text_encoder(self, args):  # pyright: ignore[reportIncompatibleMethodOverride]
         # Keep Qwen3.5 in its FP8 storage dtype; it upcasts per layer (like ComfyUI).
         return False
 
     def prepare_text_encoder_grad_ckpt_workaround(self, index, text_encoder):
-        pass
+        if index == 0:
+            super().prepare_text_encoder_grad_ckpt_workaround(index, text_encoder)
 
     def prepare_text_encoder_fp8(self, index, text_encoder, te_weight_dtype, weight_dtype):
-        pass
+        if index == 0:
+            super().prepare_text_encoder_fp8(index, text_encoder, te_weight_dtype, weight_dtype)
 
     def _move_text_encoders(self, text_encoders, device, weight_dtype):
-        text_encoders[0].to(device, dtype=weight_dtype)
-        anima_qwen35.move_qwen35_text_encoder(text_encoders[1], device)  # FP8 storage is kept where supported
+        anima_38b_train_utils.move_text_encoders(text_encoders, device, weight_dtype)
 
     def cache_text_encoder_outputs_if_needed(
         self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
@@ -189,6 +180,7 @@ class Anima38BNetworkTrainer(AnimaNetworkTrainer):
             unet.to(org_unet_device)
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
+        super().post_process_network(args, accelerator, network, text_encoders, unet)
         # The frozen connector only needs autograd when LoRA patches the native
         # adapter blocks it reuses; otherwise skip storing its activations.
         unet.semantic_connector_grad = bool(getattr(network, "train_llm_adapter", False))
@@ -198,10 +190,7 @@ class Anima38BNetworkTrainer(AnimaNetworkTrainer):
         _, states, mask = strategy_anima_38b.split_text_encoder_outputs(
             list(text_encoder_conds), len(self._require_layer_indices())
         )
-        return {
-            "semantic_hidden_states": [s.to(accelerator.device, dtype=weight_dtype) for s in states],
-            "semantic_attention_mask": mask.to(accelerator.device),
-        }
+        return anima_38b_train_utils.semantic_dit_kwargs([*states, mask], accelerator.device, weight_dtype)
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         from library import anima_train_utils
@@ -226,38 +215,7 @@ class Anima38BNetworkTrainer(AnimaNetworkTrainer):
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = setup_anima_parser()
-    parser.add_argument(
-        "--qwen35_path",
-        type=str,
-        required=True,
-        help="Path to the Anima 3.8B Qwen3.5 4B text encoder (text_encoders/qwen35_4b.safetensors)",
-    )
-    parser.add_argument(
-        "--qwen35_tokenizer_path",
-        type=str,
-        default=None,
-        help="Qwen3.5 tokenizer directory or HF repo (default: bundled configs/qwen35_4b, then Qwen/Qwen3.5-4B)",
-    )
-    parser.add_argument(
-        "--qwen35_max_token_length",
-        type=int,
-        default=1024,
-        help="Maximum Qwen3.5 prompt tokens (default 1024, same as the ComfyUI node)",
-    )
-    parser.add_argument(
-        "--qwen35_compute_dtype",
-        type=str,
-        default="float32",
-        choices=list(_DTYPES),
-        help="Activation dtype for Qwen3.5 (default float32, matching ComfyUI; bfloat16 is faster but approximate)",
-    )
-    parser.add_argument(
-        "--semantic_connector",
-        type=str,
-        default=None,
-        help="Standalone v1/v2 semantic connector. Not needed for Anima-3.8B-v1.1.safetensors, which bundles it. "
-        "For the original Anima-3.8B.safetensors use text_encoders/Anima-3.8B-expanded_adapter.safetensors",
-    )
+    anima_38b_train_utils.add_anima_38b_arguments(parser, qwen35_required=True)
     return parser
 
 

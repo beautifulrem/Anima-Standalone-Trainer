@@ -274,10 +274,12 @@ class Qwen35HybridBlock(nn.Module):
     def forward(self, x, attention_mask=None, freqs_cis=None, linear_attention_mask=None):
         residual = x
         x_norm = self.input_layernorm(x)
-        if self.use_ssm:
-            x = residual + self.linear_attn(x_norm, attention_mask=linear_attention_mask)
-        else:
-            x = residual + self.self_attn(x_norm, attention_mask=attention_mask, freqs_cis=freqs_cis)
+        mixed = (
+            self.linear_attn(x_norm, attention_mask=linear_attention_mask)
+            if self.use_ssm
+            else self.self_attn(x_norm, attention_mask=attention_mask, freqs_cis=freqs_cis)
+        )
+        x = residual + mixed
         if self.has_mlp:
             x = x + self.mlp(self.post_attention_layernorm(x))
         return x

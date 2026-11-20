@@ -4,7 +4,8 @@ import argparse
 import math
 import os
 import time
-from typing import Callable, Dict, List, Optional, Tuple, Union, cast
+from collections.abc import Callable
+from typing import cast
 
 import numpy as np
 import torch
@@ -161,7 +162,7 @@ def get_noisy_model_input_and_timesteps(
     noise: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate noisy model input and timesteps for rectified flow training.
 
     Rectified flow: noisy_input = (1 - t) * latents + t * noise
@@ -244,11 +245,11 @@ def compute_loss_weighting_for_anima(weighting_scheme: str, sigmas: torch.Tensor
 def get_anima_param_groups(
     dit,
     base_lr: float,
-    self_attn_lr: Optional[float] = None,
-    cross_attn_lr: Optional[float] = None,
-    mlp_lr: Optional[float] = None,
-    mod_lr: Optional[float] = None,
-    llm_adapter_lr: Optional[float] = None,
+    self_attn_lr: float | None = None,
+    cross_attn_lr: float | None = None,
+    mlp_lr: float | None = None,
+    mod_lr: float | None = None,
+    llm_adapter_lr: float | None = None,
 ):
     """Create parameter groups for Anima training with separate learning rates.
 
@@ -353,7 +354,11 @@ def save_anima_model_on_train_end(
             unwrap_model_for_non_fsdp=True,
             keep_torch_compile=False,
         )
-        anima_utils.save_anima_model(ckpt_file, dit_sd, save_dtype)
+        if dit_sd is None:
+            raise RuntimeError("No DiT state dict to save")
+        anima_utils.save_anima_model(
+            ckpt_file, dit_sd, save_dtype, getattr(accelerator.unwrap_model(dit), "anima_v2_connector", None)
+        )
 
     train_util.save_sd_model_on_train_end_common(args, True, True, epoch, global_step, sd_saver, None)
 
@@ -380,7 +385,11 @@ def save_anima_model_on_epoch_end_or_stepwise(
             unwrap_model_for_non_fsdp=True,
             keep_torch_compile=False,
         )
-        anima_utils.save_anima_model(ckpt_file, dit_sd, save_dtype)
+        if dit_sd is None:
+            raise RuntimeError("No DiT state dict to save")
+        anima_utils.save_anima_model(
+            ckpt_file, dit_sd, save_dtype, getattr(accelerator.unwrap_model(dit), "anima_v2_connector", None)
+        )
 
     train_util.save_sd_model_on_epoch_end_or_stepwise_common(
         args,
@@ -397,7 +406,7 @@ def save_anima_model_on_epoch_end_or_stepwise(
 
 
 # Conditioning is either a fixed tensor or a function of the timestep (Anima 3.8B v2 connector)
-CrossAttnCond = Union[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]
+CrossAttnCond = torch.Tensor | Callable[[torch.Tensor], torch.Tensor]
 
 
 def _cond_at(cond: CrossAttnCond, t: torch.Tensor) -> torch.Tensor:
@@ -408,15 +417,15 @@ def _cond_at(cond: CrossAttnCond, t: torch.Tensor) -> torch.Tensor:
 def do_sample(
     height: int,
     width: int,
-    seed: Optional[int],
+    seed: int | None,
     dit: anima_models.MiniTrainDIT,
     crossattn_emb: CrossAttnCond,
     steps: int,
     dtype: torch.dtype,
     device: torch.device,
     guidance_scale: float = 1.0,
-    neg_crossattn_emb: Optional[CrossAttnCond] = None,
-    dit_secondary: Optional[anima_models.MiniTrainDIT] = None,
+    neg_crossattn_emb: CrossAttnCond | None = None,
+    dit_secondary: anima_models.MiniTrainDIT | None = None,
 ) -> torch.Tensor:
     """Generate a sample using Euler discrete sampling for rectified flow.
 
@@ -516,16 +525,13 @@ def do_sample(
         worker_pos.start()
         worker_neg.start()
 
-    # Pre-allocate constant CFG buffers
-    if use_cfg and not use_parallel_cfg:
-        crossattn_doubled = (
-            None
-            if dynamic_cond
-            else torch.cat([cast(torch.Tensor, crossattn_emb), cast(torch.Tensor, neg_crossattn_emb)], dim=0)
-        )
-        padding_doubled = torch.cat([padding_mask, padding_mask], dim=0)
-        x_doubled = torch.empty(2, *x.shape[1:], device=device, dtype=dtype)
-        t_doubled = torch.empty(2, device=device, dtype=dtype)
+    # Pre-allocate constant CFG buffers (small; only used by sequential CFG)
+    crossattn_doubled = None
+    if use_cfg and not use_parallel_cfg and not dynamic_cond:
+        crossattn_doubled = torch.cat([cast(torch.Tensor, crossattn_emb), cast(torch.Tensor, neg_crossattn_emb)], dim=0)
+    padding_doubled = torch.cat([padding_mask, padding_mask], dim=0)
+    x_doubled = torch.empty(2, *x.shape[1:], device=device, dtype=dtype)
+    t_doubled = torch.empty(2, device=device, dtype=dtype)
 
     try:
         with torch.autocast(device_type=device.type, enabled=False):

@@ -945,7 +945,8 @@ class LoRANetwork(torch.nn.Module):
                     converted[f"{std_prefix}.lora_down.weight"] = converted[down_key]
                 if up_key in converted:
                     converted[f"{std_prefix}.lora_up.weight"] = converted[up_key]
-                converted[f"{std_prefix}.alpha"] = alpha
+                # one tensor per key: safetensors refuses shared storage (e.g. saving without dtype casting)
+                converted[f"{std_prefix}.alpha"] = alpha.clone()
             for key in list(converted.keys()):
                 if key == alpha_key or key.startswith(f"{prefix}.lora_down.") or key.startswith(f"{prefix}.lora_up."):
                     del converted[key]

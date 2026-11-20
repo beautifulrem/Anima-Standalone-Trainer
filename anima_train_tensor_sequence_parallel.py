@@ -393,6 +393,8 @@ def fuse_qkv_for_tp(model: torch.nn.Module, *, include_llm_adapter: bool = True)
 
     fused_count = 0
     for name, module in model.named_modules():
+        if name.startswith("anima_v2_connector."):
+            continue  # Anima 3.8B connector: replicated (not sharded); keep its checkpoint layout
         if isinstance(module, Attention):
             fused_count += int(_fuse_main_attention(module))
         elif include_llm_adapter and isinstance(module, LLMAdapterAttention):
@@ -475,12 +477,23 @@ def unfuse_qkv_from_tp(model: torch.nn.Module) -> None:
 def _gather_tp_weights_for_save(dit: torch.nn.Module, tp_groups) -> list:
     """All-gather TP-sharded weights to full tensors so checkpoints are valid.
 
-    Returns restore_info: list of (parent_module, attr_name, module, shard_data)
+    Packed (fused QKV/KV) layers are reassembled per part, so Q/K/V stay in
+    order, and column-parallel biases are gathered too.
+
+    Returns restore_info: list of (parent_module, attr_name, module, weight_shard, bias_shard)
     so callers can restore the original sharded ColumnParallel/RowParallel modules
     after saving (the modules are kept alive via these references).
     """
     import torch.distributed as dist
-    from wd_parallel.layers import ColumnParallelLinear, RowParallelLinear
+    from wd_parallel.layers import ColumnParallelLinear, RowParallelLinear, merge_column_shards, merge_row_shards
+
+    def _all_gather(value) -> list:
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"expected a tensor, got {type(value).__name__}")
+        t = value.detach().contiguous()
+        gathered = [torch.zeros_like(t) for _ in range(tp_groups.tp_size)]
+        dist.all_gather(gathered, t, group=tp_groups.tp)
+        return gathered
 
     restore_info = []
     for name, module in dit.named_modules():
@@ -489,38 +502,45 @@ def _gather_tp_weights_for_save(dit: torch.nn.Module, tp_groups) -> list:
         if not (is_col or is_row):
             continue
 
-        shard = module.weight.data.clone()
-        w = module.weight.data.contiguous()
-        tp_size = tp_groups.tp_size
-        gathered = [torch.zeros_like(w) for _ in range(tp_size)]
-        dist.all_gather(gathered, w, group=tp_groups.tp)
-
-        gather_dim = 0 if is_col else 1
-        full = torch.cat(gathered, dim=gather_dim)
-
-        # Trim padding back to original unpadded size
+        weight = module.weight
+        bias = module.bias
+        if not isinstance(weight, torch.Tensor):
+            continue
+        shard = weight.data.clone()
+        bias_shard = None
         if is_col:
-            orig = getattr(module, 'original_out_features', None)
-            if orig is not None:
-                full = full[:int(orig)]
+            packed = {
+                "packed_parts": getattr(module, "packed_parts", None),
+                "original_part_size": getattr(module, "original_part_size", None),
+                "padded_part_size": getattr(module, "padded_part_size", None),
+            }
+            original_out = int(getattr(module, "original_out_features", module.out_features * tp_groups.tp_size))
+            module.weight.data = merge_column_shards(
+                _all_gather(weight), original_out_features=original_out, dim=0, **packed
+            )
+            if isinstance(bias, torch.Tensor):
+                bias_shard = bias.data.clone()
+                bias.data = merge_column_shards(
+                    _all_gather(bias), original_out_features=original_out, dim=0, **packed
+                )
         else:
-            orig = getattr(module, 'original_in_features', None)
-            if orig is not None:
-                full = full[:, :int(orig)]
-
-        module.weight.data = full
+            original_in = int(getattr(module, "original_in_features", module.in_features * tp_groups.tp_size))
+            module.weight.data = merge_row_shards(_all_gather(weight), original_in_features=original_in, dim=1)
+            # row-parallel biases are replicated, not sharded
 
         parent_path, attr = name.rsplit('.', 1) if '.' in name else ('', name)
         parent = dit.get_submodule(parent_path) if parent_path else dit
-        restore_info.append((parent, attr, module, shard))
+        restore_info.append((parent, attr, module, shard, bias_shard))
 
     return restore_info
 
 
 def _restore_tp_weight_shards(restore_info: list) -> None:
     """Restore ColumnParallel/RowParallel modules with their original shard weights."""
-    for parent, attr, module, shard in restore_info:
+    for parent, attr, module, shard, bias_shard in restore_info:
         module.weight.data = shard
+        if bias_shard is not None:
+            module.bias.data = bias_shard
         setattr(parent, attr, module)
 
 
@@ -887,6 +907,8 @@ class TPSPTrainerMixin:
                 _restore_tp_weight_shards(self._tp_save_restore)
                 self._tp_save_restore = None
             dit.requires_grad_(train_dit)
+            if getattr(dit, "anima_v2_connector", None) is not None:
+                dit.anima_v2_connector.requires_grad_(False)  # Anima 3.8B: the connector stays frozen
 
     # --- Hook: gather + final unfuse before end-of-training saves ---
 

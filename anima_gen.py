@@ -255,8 +255,10 @@ def load_models(args, accelerator):
             qwen35_tokenizer_path=args.qwen35_tokenizer_path,
             qwen35_max_length=args.qwen35_max_token_length,
         )
-        connector = dit.anima_v2_connector  # attached by load_anima_dit(load_semantic_connector=True)
-        text_encoding_strategy = strategy_anima_38b.Anima38BTextEncodingStrategy(tuple(connector.layer_indices))
+        connector = anima_38b_connector.get_semantic_connector(dit)  # attached by load_anima_dit
+        if connector is None:
+            raise RuntimeError("The Anima 3.8B semantic connector was not attached to the DiT")
+        text_encoding_strategy = strategy_anima_38b.Anima38BTextEncodingStrategy(connector.layer_indices)
         text_encoders = [qwen3_text_encoder, qwen35_text_encoder]
     else:
         tokenize_strategy = strategy_anima.AnimaTokenizeStrategy(

@@ -201,6 +201,8 @@ def _attach_semantic_connector(
             logger.info(f"{source}: native LLM adapter hash matches ({actual_hash[:12]})")
 
     connector = connector_lib.build_semantic_connector(dit.llm_adapter, state, metadata)
+    connector.base_metadata = dit_metadata
+    connector.adapter_metadata = dict(metadata)
     dit.add_module("anima_v2_connector", connector)
     n_params = sum(p.numel() for p in connector.parameters())
     logger.info(
@@ -372,13 +374,20 @@ def load_t5_tokenizer(t5_tokenizer_path: Optional[str] = None):
     )
 
 
-def save_anima_model(save_path: str, dit_state_dict: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None):
+def save_anima_model(
+    save_path: str,
+    dit_state_dict: "dict[str, torch.Tensor]",
+    dtype: "torch.dtype | None" = None,
+    semantic_connector=None,
+):
     """Save Anima DiT model with 'net.' prefix for ComfyUI compatibility.
 
     Args:
         save_path: Output path (.safetensors)
         dit_state_dict: State dict from dit.state_dict()
         dtype: Optional dtype to cast to before saving
+        semantic_connector: The DiT's Anima 3.8B connector (``dit.anima_v2_connector``), if any.
+            A v2 connector is written back in the v1.1 bundle layout and metadata.
     """
     prefixed_sd = {}
     for k, v in dit_state_dict.items():
@@ -386,7 +395,12 @@ def save_anima_model(save_path: str, dit_state_dict: Dict[str, torch.Tensor], dt
             v = v.to(dtype)
         prefixed_sd['net.' + k] = v.contiguous()
 
-    save_file(prefixed_sd, save_path, metadata={'format': 'pt'})
+    metadata = {'format': 'pt'}
+    if semantic_connector is not None:
+        from library import anima_38b_connector
+
+        prefixed_sd, metadata = anima_38b_connector.prepare_bundle_for_save(prefixed_sd, semantic_connector)
+    save_file(prefixed_sd, save_path, metadata=metadata)
     logger.info(f"Saved Anima model to {save_path}")
 
 

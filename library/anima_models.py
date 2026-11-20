@@ -1460,9 +1460,15 @@ class MiniTrainDIT(nn.Module):
             connector_timesteps = None
             if timesteps is not None:
                 connector_timesteps = timesteps.reshape(timesteps.shape[0], -1)[:, 0]
-            # The frozen connector only needs autograd when LoRA patches the
-            # native adapter it reuses (train_llm_adapter) or it is trained itself.
-            grad_enabled = torch.is_grad_enabled() and getattr(self, 'semantic_connector_grad', True)
+            # The frozen connector only needs autograd when the native adapter it reuses
+            # trains (LoRA train_llm_adapter or full fine-tuning) or it is trained itself.
+            # Network trainers set semantic_connector_grad; otherwise it is derived here.
+            needs_grad = getattr(self, 'semantic_connector_grad', None)
+            if needs_grad is None:
+                needs_grad = any(p.requires_grad for p in connector.parameters()) or any(
+                    p.requires_grad for p in self.llm_adapter.parameters()
+                )
+            grad_enabled = torch.is_grad_enabled() and needs_grad
             # Like ComfyUI: feed both streams in the native adapter's dtype.
             adapter_dtype = self.llm_adapter.embed.weight.dtype
             if not adapter_dtype.is_floating_point or adapter_dtype.itemsize == 1:

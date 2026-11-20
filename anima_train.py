@@ -26,6 +26,7 @@ from library import (
     anima_models,
     anima_train_utils,
     anima_utils,
+    anima_38b_train_utils,
     custom_offloading_utils,
     save_utils,
     strategy_base,
@@ -229,6 +230,9 @@ class AnimaTrainer:
                 logger.warning("flash_attn package not installed, falling back to PyTorch SDPA")
                 args.flash_attn = False
 
+        # Anima 3.8B (Qwen3.5 semantic connector): detected from the checkpoint
+        anima38b = anima_38b_train_utils.Anima38BFullTraining.from_args(args)
+
         cache_latents = args.cache_latents
         use_dreambooth_method = args.in_json is None
 
@@ -328,7 +332,9 @@ class AnimaTrainer:
         if args.debug_dataset:
             if args.cache_text_encoder_outputs:
                 strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(
-                    strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
+                    anima38b.caching_strategy(args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, False)
+                    if anima38b is not None
+                    else strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
                         args.cache_text_encoder_outputs_to_disk,
                         args.text_encoder_batch_size,
                         False,
@@ -384,41 +390,53 @@ class AnimaTrainer:
         )
 
         # Set tokenize strategy
-        tokenize_strategy = strategy_anima.AnimaTokenizeStrategy(
-            qwen3_tokenizer=qwen3_tokenizer,
-            t5_tokenizer=t5_tokenizer,
-            qwen3_max_length=args.qwen3_max_token_length,
-            t5_max_length=args.t5_max_token_length,
-        )
+        if anima38b is not None:
+            tokenize_strategy = anima38b.tokenize_strategy(qwen3_tokenizer, t5_tokenizer)
+        else:
+            tokenize_strategy = strategy_anima.AnimaTokenizeStrategy(
+                qwen3_tokenizer=qwen3_tokenizer,
+                t5_tokenizer=t5_tokenizer,
+                qwen3_max_length=args.qwen3_max_token_length,
+                t5_max_length=args.t5_max_token_length,
+            )
         strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
 
         # Set text encoding strategy
         caption_dropout_rate = getattr(args, 'caption_dropout_rate', 0.0)
-        text_encoding_strategy = strategy_anima.AnimaTextEncodingStrategy(
-            dropout_rate=caption_dropout_rate,
+        text_encoding_strategy = (
+            anima38b.text_encoding_strategy(caption_dropout_rate)
+            if anima38b is not None
+            else strategy_anima.AnimaTextEncodingStrategy(dropout_rate=caption_dropout_rate)
         )
         strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
 
         # Prepare text encoder (always frozen for Anima)
         qwen3_text_encoder.to(weight_dtype)
         qwen3_text_encoder.requires_grad_(False)
+        # [qwen3] or, for Anima 3.8B, [qwen3, qwen35] (Qwen3.5 stays frozen in its FP8 storage)
+        text_encoders = [qwen3_text_encoder] if anima38b is None else [qwen3_text_encoder, anima38b.load_qwen35()]
 
         # Cache text encoder outputs
         sample_prompts_te_outputs = None
         if args.cache_text_encoder_outputs:
-            qwen3_text_encoder.to(accelerator.device)
+            anima_38b_train_utils.move_text_encoders(text_encoders, accelerator.device)
             qwen3_text_encoder.eval()
 
-            text_encoder_caching_strategy = strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
-                args.cache_text_encoder_outputs_to_disk,
-                args.text_encoder_batch_size,
-                args.skip_cache_check,
-                is_partial=False,
-            )
+            if anima38b is not None:
+                text_encoder_caching_strategy = anima38b.caching_strategy(
+                    args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check
+                )
+            else:
+                text_encoder_caching_strategy = strategy_anima.AnimaTextEncoderOutputsCachingStrategy(
+                    args.cache_text_encoder_outputs_to_disk,
+                    args.text_encoder_batch_size,
+                    args.skip_cache_check,
+                    is_partial=False,
+                )
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_caching_strategy)
 
             with accelerator.autocast():
-                train_dataset_group.new_cache_text_encoder_outputs([qwen3_text_encoder], accelerator)
+                train_dataset_group.new_cache_text_encoder_outputs(text_encoders, accelerator)
 
             # cache sample prompt embeddings
             if args.sample_prompts is not None:
@@ -433,7 +451,7 @@ class AnimaTrainer:
                                 tokens_and_masks = tokenize_strategy.tokenize(p)
                                 sample_prompts_te_outputs[p] = text_encoding_strategy.encode_tokens(
                                     tokenize_strategy,
-                                    [qwen3_text_encoder],
+                                    text_encoders,
                                     tokens_and_masks,
                                     enable_dropout=False,
                                 )
@@ -442,7 +460,7 @@ class AnimaTrainer:
             caption_dropout_rate = getattr(args, 'caption_dropout_rate', 0.0)
             if caption_dropout_rate > 0.0:
                 with accelerator.autocast():
-                    text_encoding_strategy.cache_uncond_embeddings(tokenize_strategy, [qwen3_text_encoder])
+                    text_encoding_strategy.cache_uncond_embeddings(tokenize_strategy, text_encoders)
 
             accelerator.wait_for_everyone()
 
@@ -456,6 +474,7 @@ class AnimaTrainer:
 
             # free text encoder memory
             qwen3_text_encoder = None
+            text_encoders = None
             clean_memory_on_device(accelerator.device)
 
         # Load VAE and cache latents
@@ -486,6 +505,7 @@ class AnimaTrainer:
             transformer_dtype=transformer_dtype,
             llm_adapter_path=getattr(args, 'llm_adapter_path', None),
             disable_mmap=getattr(args, 'disable_mmap_load_safetensors', False),
+            **(anima38b.dit_load_kwargs() if anima38b is not None else {}),
         )
 
         if args.gradient_checkpointing:
@@ -499,6 +519,8 @@ class AnimaTrainer:
 
         train_dit = args.learning_rate != 0
         dit.requires_grad_(train_dit)
+        if anima38b is not None:
+            anima38b.prepare_dit(dit)  # the semantic connector stays frozen
         if train_dit and getattr(args, "freeze_inserted_only_training", False):
             freeze_summary = anima_block_freeze.apply_inserted_only_training_freeze(dit)
             if getattr(args, 'llm_adapter_lr', None) != 0 and hasattr(dit, 'llm_adapter'):
@@ -694,8 +716,8 @@ class AnimaTrainer:
             dit.to(weight_dtype)
 
         # move text encoder to GPU if not cached
-        if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
-            qwen3_text_encoder.to(accelerator.device)
+        if not args.cache_text_encoder_outputs and text_encoders is not None:
+            anima_38b_train_utils.move_text_encoders(text_encoders, accelerator.device)
 
         clean_memory_on_device(accelerator.device)
 
@@ -735,8 +757,8 @@ class AnimaTrainer:
                 prev = _ph_end
 
         # Move non-training models back to GPU
-        if not args.cache_text_encoder_outputs and qwen3_text_encoder is not None:
-            qwen3_text_encoder.to(accelerator.device)
+        if not args.cache_text_encoder_outputs and text_encoders is not None:
+            anima_38b_train_utils.move_text_encoders(text_encoders, accelerator.device)
         if not cache_latents and vae is not None:
             vae.to(accelerator.device, dtype=weight_dtype)
 
@@ -888,7 +910,7 @@ class AnimaTrainer:
         optimizer_eval_fn()
         anima_train_utils.sample_images(
             accelerator, args, 0, global_step, dit, vae, vae_scale,
-            qwen3_text_encoder, tokenize_strategy, text_encoding_strategy,
+            text_encoders, tokenize_strategy, text_encoding_strategy,
             sample_prompts_te_outputs,
         )
         optimizer_train_fn()
@@ -994,17 +1016,17 @@ class AnimaTrainer:
                         text_encoder_outputs_list = text_encoding_strategy.drop_cached_text_encoder_outputs(
                             *text_encoder_outputs_list
                         )
-                        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoder_outputs_list
+                        prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, *semantic_outputs = text_encoder_outputs_list
                     else:
-                        # Encode on-the-fly
+                        # Encode on-the-fly (Anima 3.8B: Qwen3.5 ids and mask follow the native ids)
                         input_ids_list = batch["input_ids_list"]
-                        qwen3_input_ids, qwen3_attn_mask, t5_input_ids, t5_attn_mask = input_ids_list
                         with torch.no_grad():
-                            prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask = text_encoding_strategy.encode_tokens(
-                                tokenize_strategy,
-                                [qwen3_text_encoder],
-                                [qwen3_input_ids, qwen3_attn_mask, t5_input_ids, t5_attn_mask],
+                            prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, *semantic_outputs = (
+                                text_encoding_strategy.encode_tokens(tokenize_strategy, text_encoders or [], list(input_ids_list))
                             )
+                    semantic_kwargs = (
+                        anima38b.dit_kwargs(semantic_outputs, accelerator.device, weight_dtype) if anima38b is not None else {}
+                    )
 
                     # Move to device
                     prompt_embeds = prompt_embeds.to(accelerator.device, dtype=weight_dtype)
@@ -1047,6 +1069,7 @@ class AnimaTrainer:
                             source_attention_mask=attn_mask,
                             t5_input_ids=t5_input_ids,
                             t5_attn_mask=t5_attn_mask,
+                            **semantic_kwargs,
                         )
 
                     # Compute loss (rectified flow: target = noise - latents)
@@ -1131,7 +1154,7 @@ class AnimaTrainer:
                     optimizer_eval_fn()
                     anima_train_utils.sample_images(
                         accelerator, args, None, global_step, dit, vae, vae_scale,
-                        qwen3_text_encoder, tokenize_strategy, text_encoding_strategy,
+                        text_encoders, tokenize_strategy, text_encoding_strategy,
                         sample_prompts_te_outputs,
                     )
 
@@ -1194,7 +1217,7 @@ class AnimaTrainer:
 
             anima_train_utils.sample_images(
                 accelerator, args, epoch + 1, global_step, dit, vae, vae_scale,
-                qwen3_text_encoder, tokenize_strategy, text_encoding_strategy,
+                text_encoders, tokenize_strategy, text_encoding_strategy,
                 sample_prompts_te_outputs,
             )
 
@@ -1246,6 +1269,7 @@ def setup_parser() -> argparse.ArgumentParser:
     add_custom_train_arguments(parser)
     train_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
+    anima_38b_train_utils.add_anima_38b_arguments(parser)
     sai_model_spec.add_model_spec_arguments(parser)
 
     parser.add_argument(

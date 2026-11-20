@@ -271,6 +271,9 @@ class ProgressiveQwen35CrossAdapter(nn.Module):
         object.__setattr__(self, "_native_adapter", native_adapter)
         self.layer_indices = tuple(int(index) for index in layer_indices)
         self.native_context_scale = float(native_context_scale)
+        # Source checkpoint metadata, used to write the connector back when saving.
+        self.base_metadata: dict[str, str] = {}
+        self.adapter_metadata: dict[str, str] = {}
         model_dim = native_adapter.embed.weight.shape[1]
         num_heads = native_adapter.blocks[0].self_attn.n_heads
         head_dim = model_dim // num_heads
@@ -422,6 +425,8 @@ class QualityAnchoredSemanticConnectorV2(nn.Module):
         super().__init__()
         object.__setattr__(self, "_native_adapter", native_adapter)
         self.layer_indices = tuple(int(index) for index in layer_indices)
+        self.base_metadata: dict[str, str] = {}
+        self.adapter_metadata: dict[str, str] = {}
         self.quality_anchor = ProgressiveQwen35CrossAdapter(
             native_adapter,
             semantic_source_dim=semantic_source_dim,
@@ -684,6 +689,82 @@ def check_native_adapter_hash(native_adapter: Any, metadata: Mapping[str, str], 
             f"(expected sha256 {expected[:12]}…, got {actual[:12]}…). "
             "This is expected after LLM-adapter fine-tuning or dtype conversion, otherwise check the model pair."
         )
+
+
+def bundle_save_metadata(
+    base_metadata: Mapping[str, str],
+    adapter_metadata: Mapping[str, str],
+    architecture: str,
+    native_hash: str,
+) -> dict[str, str]:
+    """Metadata for a v1.1-style bundle (same layout as the ComfyUI ``bundle_v2.py`` tool).
+
+    ``base_metadata`` is the source DiT's metadata (adapter keys are replaced),
+    ``adapter_metadata`` the connector's own metadata without the prefix.
+    """
+    metadata = {
+        name: value for name, value in base_metadata.items() if not name.startswith(BUNDLE_ADAPTER_METADATA_PREFIX)
+    }
+    metadata.setdefault("anima_v2_strength", "1.0")
+    metadata.update(
+        {
+            "format": "pt",
+            "architecture": BUNDLE_ARCHITECTURE,
+            "anima_v2_bundle_format": BUNDLE_FORMAT,
+            "anima_v2_connector_prefix": "net." + CONNECTOR_PREFIX,
+            # The DiT's native adapter may have been fine-tuned: record the saved one.
+            "anima_v2_native_sha256": native_hash,
+        }
+    )
+    adapter = dict(adapter_metadata)
+    adapter["architecture"] = architecture
+    for name, value in adapter.items():
+        metadata[BUNDLE_ADAPTER_METADATA_PREFIX + name] = value
+    return metadata
+
+
+def prepare_bundle_for_save(
+    state_dict: dict[str, torch.Tensor],
+    connector: SemanticConnector,
+) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
+    """Turn a DiT state dict (``net.`` prefixed, already in the save dtype) into a 3.8B checkpoint.
+
+    v2 connectors are saved inside the checkpoint (v1.1 bundle layout), so it loads
+    in ComfyUI exactly like the released model. v1 connectors have no bundle format:
+    they are dropped and must keep being loaded from their standalone file.
+    """
+    prefix = "net." + CONNECTOR_PREFIX
+    if connector.architecture != V2_ARCHITECTURE:
+        logger.warning(
+            "The v1 semantic connector is not saved into the checkpoint; keep using its standalone file "
+            "(--semantic_connector) with the saved model."
+        )
+        return {k: v for k, v in state_dict.items() if not k.startswith(prefix)}, {"format": "pt"}
+    if not any(k.startswith(prefix) for k in state_dict):
+        raise RuntimeError("The semantic connector tensors are missing from the state dict to save")
+    adapter_prefix = "net.llm_adapter."
+    native_hash = native_adapter_hash(
+        {k[len(adapter_prefix) :]: v for k, v in state_dict.items() if k.startswith(adapter_prefix)}
+    )
+    metadata = bundle_save_metadata(
+        connector.base_metadata, connector.adapter_metadata, connector.architecture, native_hash
+    )
+    return state_dict, metadata
+
+
+def get_semantic_connector(dit: Any) -> SemanticConnector | None:
+    """The connector attached to a DiT by ``load_anima_dit(load_semantic_connector=True)``, if any."""
+    connector = getattr(dit, "anima_v2_connector", None)
+    if isinstance(connector, (ProgressiveQwen35CrossAdapter, QualityAnchoredSemanticConnectorV2)):
+        return connector
+    return None
+
+
+def semantic_layer_indices_for(dit_path: str, semantic_connector_path: str | None = None) -> tuple[int, ...]:
+    """Qwen3.5 layers the connector reads, without loading the model."""
+    if semantic_connector_path:
+        return layer_indices_from_metadata(read_safetensors_metadata(semantic_connector_path))
+    return layer_indices_from_metadata(bundle_connector_metadata(read_safetensors_metadata(dit_path)))
 
 
 def is_anima_38b_checkpoint(path: str | None) -> bool:

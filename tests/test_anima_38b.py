@@ -14,7 +14,13 @@ from safetensors.torch import save_file
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from library import anima_38b_connector as C  # noqa: E402
-from library import anima_models, anima_train_utils, anima_utils, strategy_anima_38b, strategy_base  # noqa: E402
+from library import (  # noqa: E402
+    anima_models,
+    anima_train_utils,
+    anima_utils,
+    strategy_anima_38b,
+    strategy_base,
+)
 
 LAYERS = C.LAYER_INDICES
 
@@ -229,3 +235,61 @@ def test_text_encoder_cache_roundtrip(tmp_path):
 
     other = strategy_anima_38b.Anima38BTextEncoderOutputsCachingStrategy(True, 2, False, LAYERS, 512)
     assert not other.is_disk_cached_outputs_expected(infos[0].text_encoder_outputs_npz)
+
+
+def _adapter_param(dit, name: str) -> torch.nn.Parameter:
+    return dict(dit.llm_adapter.named_parameters())[name]
+
+
+def _save_and_reload(tmp_path, dit, connector):
+    path = tmp_path / "saved.safetensors"
+    anima_utils.save_anima_model(str(path), dit.state_dict(), torch.float32, connector)
+    from safetensors.torch import load_file
+
+    return load_file(str(path)), C.read_safetensors_metadata(str(path))
+
+
+@torch.no_grad()
+def test_full_finetune_save_writes_v11_bundle(tmp_path):
+    dit = _tiny_dit()
+    connector = _tiny_v2(dit.llm_adapter, seed=7)
+    connector.base_metadata = {"new_block_count": "52", "anima_v2_adapter_step": "old", "architecture": "old"}
+    connector.adapter_metadata = {"layer_indices": "[7, 15, 23, 31]", "semantic_query_tokens": "8"}
+    dit.add_module("anima_v2_connector", connector)
+    _adapter_param(dit, "blocks.0.mlp.0.weight").add_(1.0)  # e.g. a fine-tuned native adapter
+
+    saved, metadata = _save_and_reload(tmp_path, dit, connector)
+    assert C.is_bundle_metadata(metadata) and metadata["anima_v2_bundle_format"] == C.BUNDLE_FORMAT
+    assert metadata["anima_v2_connector_prefix"] == "net.anima_v2_connector."
+    assert metadata["new_block_count"] == "52" and "anima_v2_adapter_step" not in metadata
+    assert C.bundle_connector_metadata(metadata) == {**connector.adapter_metadata, "architecture": C.V2_ARCHITECTURE}
+    native = {k[len("net.llm_adapter."):]: v for k, v in saved.items() if k.startswith("net.llm_adapter.")}
+    assert metadata["anima_v2_native_sha256"] == C.native_adapter_hash(native)
+    for name, value in connector.state_dict().items():
+        assert torch.equal(saved["net.anima_v2_connector." + name], value)
+
+
+@torch.no_grad()
+def test_full_finetune_save_drops_standalone_v1_connector(tmp_path):
+    dit = _tiny_dit()
+    connector = C.ProgressiveQwen35CrossAdapter(dit.llm_adapter)
+    dit.add_module("anima_v2_connector", connector)
+    saved, metadata = _save_and_reload(tmp_path, dit, connector)
+    assert not any(k.startswith("net.anima_v2_connector.") for k in saved)
+    assert metadata == {"format": "pt"}
+
+
+def test_connector_grad_follows_native_adapter():
+    dit = _tiny_dit()
+    connector = _tiny_v2(dit.llm_adapter, seed=9)
+    _randomize_v2_outputs(connector)
+    dit.add_module("anima_v2_connector", connector)
+    dit.requires_grad_(False)
+    native, ids, states, mask = _inputs(batch=1, target_len=6)
+    t = torch.tensor([0.5])
+    assert not dit.compute_crossattn_emb(native, t, None, ids, None, states, mask[:1]).requires_grad
+    dit.llm_adapter.requires_grad_(True)  # full fine-tuning with a trainable native adapter
+    out = dit.compute_crossattn_emb(native, t, None, ids, None, states, mask[:1])
+    out.sum().backward()
+    assert _adapter_param(dit, "blocks.0.mlp.0.weight").grad is not None
+    assert all(p.grad is None for p in connector.parameters())

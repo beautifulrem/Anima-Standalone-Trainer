@@ -57,8 +57,12 @@ class Anima38BTokenizeStrategy(AnimaTokenizeStrategy):
         t5_max_length: int = 512,
         qwen35_tokenizer_path: str | None = None,
         qwen35_max_length: int = 1024,
+        qwen3_tokenizer: Any = None,
+        t5_tokenizer: Any = None,
     ) -> None:
         super().__init__(
+            qwen3_tokenizer=qwen3_tokenizer,
+            t5_tokenizer=t5_tokenizer,
             qwen3_path=qwen3_path,
             t5_tokenizer_path=t5_tokenizer_path,
             qwen3_max_length=qwen3_max_length,
@@ -94,12 +98,13 @@ class Anima38BTextEncodingStrategy(AnimaTextEncodingStrategy):
         device = qwen35_model.embed_tokens.weight.device
         input_ids = input_ids.to(device=device, dtype=torch.long)
         attention_mask = attention_mask.to(device=device, dtype=torch.long)
-        _, intermediate = qwen35_model(
-            input_ids,
-            attention_mask=attention_mask,
-            intermediate_output=list(self.layer_indices),
-            return_final=False,
-        )
+        with torch.no_grad():  # Qwen3.5 is always frozen, even when the Qwen3 LoRA trains
+            _, intermediate = qwen35_model(
+                input_ids,
+                attention_mask=attention_mask,
+                intermediate_output=list(self.layer_indices),
+                return_final=False,
+            )
         if not isinstance(intermediate, dict):
             raise RuntimeError("Qwen3.5 did not return the requested hidden layers")
         valid = attention_mask.bool().unsqueeze(-1)

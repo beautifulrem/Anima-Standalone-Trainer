@@ -1,4 +1,4 @@
-# Anima 3.8B LoRA training
+# Anima 3.8B training
 
 [Anima 3.8B](https://huggingface.co/lylogummy/Anima-3.8B) is a 52-block Anima DiT
 (LLaMA-Pro expansion of the 40-block 2.9B) whose text conditioning adds a
@@ -54,15 +54,36 @@ accelerate launch anima_38b_train_network.py \
 ```
 
 In the Web UI, set **Qwen3.5 4B Text Encoder Path** in Global Settings. The
-server detects a 3.8B DiT by its bundle metadata or its 52 blocks, and then
-launches `anima_38b_train_network.py` automatically.
+server detects a 3.8B DiT by its bundle metadata or its 52 blocks. LoRA jobs
+then use `anima_38b_train_network.py`; full fine-tuning (also with Muon) and
+the TP/SP scripts detect the checkpoint themselves.
+
+## Scripts
+
+| Mode | Script | Anima 3.8B handling |
+| --- | --- | --- |
+| LoRA / LyCORIS | `anima_38b_train_network.py` | dedicated trainer |
+| Full fine-tuning | `anima_train.py`, `anima_train_muon.py` | auto-detected, needs `--qwen35_path` |
+| LoRA, TP/SP | `anima_train_network_tensor_sequence_parallel.py` | auto-detected |
+| Full fine-tuning, TP/SP | `anima_train_tensor_sequence_parallel.py` | auto-detected |
+
+In every mode the connector and Qwen3.5 stay frozen. Under TP/SP the DiT
+blocks and native adapter are sharded as usual; the connector is replicated on
+each rank.
 
 ## Notes
 
-- **Only DiT networks are trained.** The DiT can be trained with LoRA, LoHa
-  or LoKr, and optionally the native adapter blocks too
-  (`--network_args train_llm_adapter=True`). Both text encoders and the
-  connector stay frozen, and `--network_train_unet_only` is required.
+- **What LoRA trains.** The DiT (LoRA, LoHa or LoKr), optionally the native
+  adapter blocks (`--network_args train_llm_adapter=True`) and, like regular
+  Anima, the Qwen3 0.6B text encoder (omit `--network_train_unet_only`; this
+  needs uncached text-encoder outputs, so Qwen3.5 runs every step). Qwen3.5
+  and the connector are never trained.
+- **Full fine-tuning** trains the DiT and, unless `--llm_adapter_lr 0`, the
+  native adapter. Checkpoints are saved in the v1.1 bundle layout: the
+  unchanged connector under `net.anima_v2_connector.*`, the original
+  metadata, and `anima_v2_native_sha256` updated to the saved adapter, so
+  they load in ComfyUI like the release. A standalone v1 connector
+  (`--semantic_connector`) is not embedded; keep using its file.
 - **Caching is strongly recommended.**
   - Use `--cache_text_encoder_outputs`. The Qwen3.5 states are stored
     trimmed to the prompt length, in bf16 safetensors files named
@@ -89,13 +110,9 @@ launches `anima_38b_train_network.py` automatically.
   training dtype, because element-wise ops cannot mix fp8 and float. This also
   fixes `--fp8_base` for regular Anima LoRA training, where casting the whole
   DiT used to fail in the LLM adapter.
-- **Not supported** (rejected with a clear error):
-  - full fine-tuning (`anima_train.py`, `anima_train_muon.py`);
-  - TP/SP;
-  - training the text encoders;
-  - `--weighted_captions`.
-- Every non-3.8B training script refuses an Anima 3.8B bundle. Otherwise it would
-  train without the connector, and a full fine-tune would save the model with
-  the connector removed.
+- **Not supported:** `--weighted_captions` (Anima has no prompt-weight
+  implementation, and ComfyUI applies no weights to the Qwen3.5 stream).
+- `anima_train_network.py` refuses an Anima 3.8B bundle (use
+  `anima_38b_train_network.py`), so the connector is never silently dropped.
 - **Saved LoRAs** use the usual `lora_unet_blocks_N_*` names for blocks 0–51,
   and load in ComfyUI like any Anima LoRA.
