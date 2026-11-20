@@ -181,9 +181,12 @@ class Anima38BNetworkTrainer(AnimaNetworkTrainer):
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
         super().post_process_network(args, accelerator, network, text_encoders, unet)
-        # The frozen connector only needs autograd when LoRA patches the native
-        # adapter blocks it reuses; otherwise skip storing its activations.
-        unet.semantic_connector_grad = bool(getattr(network, "train_llm_adapter", False))
+        # The frozen connector needs autograd when gradients must pass through it:
+        # to the native adapter blocks it reuses (train_llm_adapter) or back to the
+        # Qwen3 text encoder (text-encoder LoRA). Otherwise skip storing its
+        # activations. Networks without the flag (e.g. LyCORIS) may patch the adapter.
+        trains_adapter = bool(getattr(network, "train_llm_adapter", True))
+        unet.semantic_connector_grad = trains_adapter or self.is_train_text_encoder(args)
 
     # ------------------------------------------------------------ training
     def get_extra_dit_kwargs(self, text_encoder_conds, accelerator, weight_dtype) -> dict:

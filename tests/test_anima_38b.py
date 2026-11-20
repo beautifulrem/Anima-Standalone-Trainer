@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from library import anima_38b_connector as C  # noqa: E402
 from library import (  # noqa: E402
+    anima_block_freeze,
     anima_models,
     anima_train_utils,
     anima_utils,
@@ -293,3 +294,13 @@ def test_connector_grad_follows_native_adapter():
     out.sum().backward()
     assert _adapter_param(dit, "blocks.0.mlp.0.weight").grad is not None
     assert all(p.grad is None for p in connector.parameters())
+
+
+def test_inserted_only_freeze_supports_52_blocks():
+    dit = torch.nn.Module()
+    dit.blocks = torch.nn.ModuleList(torch.nn.Linear(2, 2) for _ in range(52))
+    dit.llm_adapter = torch.nn.Linear(2, 2)
+    summary = anima_block_freeze.apply_inserted_only_training_freeze(dit)
+    trainable = [i for i, b in enumerate(dit.blocks) if b.weight.requires_grad]
+    assert trainable == list(anima_block_freeze.INSERTED_52_BLOCK_INDICES) == summary["inserted_block_indices"]
+    assert not dit.llm_adapter.weight.requires_grad  # the trainer re-enables it unless --llm_adapter_lr 0

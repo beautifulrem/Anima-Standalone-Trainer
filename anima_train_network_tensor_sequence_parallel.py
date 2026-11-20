@@ -53,6 +53,20 @@ from anima_train_network import AnimaNetworkTrainer
 from library import anima_38b_train_utils  # noqa: E402
 
 
+def _sync_python_random(tp_group, device) -> None:
+    """Give every TP rank rank 0's Python RNG stream for this step.
+
+    Caption dropout (strategy_anima*.drop_cached_text_encoder_outputs) draws from
+    Python's ``random``. TP ranks must drop the same captions, otherwise they
+    compute one forward pass from different cross-attention contexts.
+    """
+    import random
+
+    seed = torch.tensor([random.getrandbits(62)], dtype=torch.int64, device=device)
+    dist.broadcast(seed, src=0, group=tp_group)
+    random.seed(int(seed.item()))
+
+
 def _ceil_to_multiple(size: int, multiple: int) -> int:
     return ((size + multiple - 1) // multiple) * multiple
 
@@ -386,6 +400,24 @@ def _mark_replicated_context_layers_no_input_grad(
     return marked
 
 
+def _restore_replicated_context_input_grad(model: torch.nn.Module, network: torch.nn.Module) -> int:
+    """Undo _mark_replicated_context_layers_no_input_grad when LoRA trains the LLM adapter.
+
+    The cross-attn context is the adapter output, so its LoRA needs the input grad.
+    Networks without the flag (e.g. LyCORIS) may patch the adapter too.
+    """
+    if not getattr(model, "use_llm_adapter", False) or not getattr(network, "train_llm_adapter", True):
+        return 0
+    restored = 0
+    for module in model.modules():
+        if getattr(module, "skip_input_grad", False):
+            module.skip_input_grad = False  # pyright: ignore[reportArgumentType]
+            restored += 1
+    if restored:
+        logger.info(f"LLM adapter LoRA: re-enabled input grad on {restored} replicated cross-attn context layers")
+    return restored
+
+
 def _tag_tp_lora_params(network: torch.nn.Module) -> tuple[int, int]:
     """Tag TP-sharded and SP-partial LoRA params for wd_parallel grad sync.
 
@@ -716,6 +748,7 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             self._tp_last_args = args
             tp_group = self.tp_groups.tp
             dev = accelerator.device
+            _sync_python_random(tp_group, dev)
 
             # Latents (main tensor - shape differs across resolution buckets)
             if "latents" in batch and batch["latents"] is not None:
@@ -889,6 +922,8 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
 
         if not self.tp_active:
             return
+
+        _restore_replicated_context_input_grad(unet, network)
 
         sharded, partial = _tag_tp_lora_params(network)
         logger.info(f"Tagged {sharded} TP-sharded LoRA parameters and {partial} SP-partial replicated LoRA parameters")

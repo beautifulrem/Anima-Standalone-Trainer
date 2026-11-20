@@ -499,7 +499,11 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                     input_ids,
                 )
                 if args.full_fp16:
-                    encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
+                    # only float outputs: token ids / masks must stay exact
+                    encoded_text_encoder_conds = [
+                        c.to(weight_dtype) if c is not None and c.is_floating_point() else c
+                        for c in encoded_text_encoder_conds
+                    ]
 
             if len(text_encoder_conds) == 0:
                 text_encoder_conds = encoded_text_encoder_conds

@@ -13,7 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 INSERTED_40_BLOCK_INDICES: Sequence[int] = (2, 5, 8, 11, 14, 17, 21, 24, 27, 30, 33, 36)
-SUPPORTED_BLOCK_COUNTS = (28, 40)
+# Anima 3.8B: 12 blocks inserted into the 40-block model (checkpoint metadata "insertion_positions")
+INSERTED_52_BLOCK_INDICES: Sequence[int] = (3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47)
+INSERTED_BLOCK_INDICES = {40: INSERTED_40_BLOCK_INDICES, 52: INSERTED_52_BLOCK_INDICES}
+SUPPORTED_BLOCK_COUNTS = (28, 40, 52)
 
 
 def _count_trainable_parameters(module: nn.Module) -> int:
@@ -27,16 +30,16 @@ def apply_inserted_only_training_freeze(dit: nn.Module) -> Dict[str, object]:
     block_count = len(dit.blocks)
     if block_count == 28:
         raise ValueError(
-            "freeze_inserted_only_training requires the 40-layer expanded checkpoint. "
+            "freeze_inserted_only_training requires an expanded checkpoint (40 or 52 blocks). "
             "The loaded checkpoint only has 28 blocks."
         )
-    if block_count != 40:
+    if block_count not in INSERTED_BLOCK_INDICES:
         raise ValueError(
-            f"freeze_inserted_only_training only supports 28- or 40-block Anima checkpoints today. "
+            f"freeze_inserted_only_training only supports 40- or 52-block Anima checkpoints today. "
             f"Detected {block_count} blocks."
         )
 
-    inserted_block_indices = list(INSERTED_40_BLOCK_INDICES)
+    inserted_block_indices = list(INSERTED_BLOCK_INDICES[block_count])
     inserted_block_index_set = set(inserted_block_indices)
     inherited_block_indices = [index for index in range(block_count) if index not in inserted_block_index_set]
 
@@ -57,7 +60,7 @@ def apply_inserted_only_training_freeze(dit: nn.Module) -> Dict[str, object]:
         "non_block_trainable_names": non_block_trainable_names,
     }
 
-    logger.info("Applied inserted-only training freeze for 40-layer Anima DiT.")
+    logger.info(f"Applied inserted-only training freeze for {block_count}-layer Anima DiT.")
     logger.info(f"  Inserted trainable blocks: {inserted_block_indices}")
     logger.info(f"  Frozen inherited blocks: {inherited_block_indices}")
     logger.info(f"  Trainable parameters after freeze: {summary['trainable_parameter_count']:,}")

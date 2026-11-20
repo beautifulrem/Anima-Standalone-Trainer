@@ -84,6 +84,8 @@ each rank.
   metadata, and `anima_v2_native_sha256` updated to the saved adapter, so
   they load in ComfyUI like the release. A standalone v1 connector
   (`--semantic_connector`) is not embedded; keep using its file.
+  `--freeze_inserted_only_training` trains only the 12 blocks the 3.8B
+  expansion inserted (3, 7, …, 47) plus the native adapter.
 - **Caching is strongly recommended.**
   - Use `--cache_text_encoder_outputs`. The Qwen3.5 states are stored
     trimmed to the prompt length, in bf16 safetensors files named

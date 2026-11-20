@@ -535,6 +535,20 @@ def _gather_tp_weights_for_save(dit: torch.nn.Module, tp_groups) -> list:
     return restore_info
 
 
+def _sync_python_random(tp_group, device) -> None:
+    """Give every TP rank rank 0's Python RNG stream for this step.
+
+    Caption dropout (strategy_anima*.drop_cached_text_encoder_outputs) draws from
+    Python's ``random``. TP ranks must drop the same captions, otherwise they
+    compute one forward pass from different cross-attention contexts.
+    """
+    import random
+
+    seed = torch.tensor([random.getrandbits(62)], dtype=torch.int64, device=device)
+    dist.broadcast(seed, src=0, group=tp_group)
+    random.seed(int(seed.item()))
+
+
 def _restore_tp_weight_shards(restore_info: list) -> None:
     """Restore ColumnParallel/RowParallel modules with their original shard weights."""
     for parent, attr, module, shard, bias_shard in restore_info:
@@ -727,6 +741,7 @@ class TPSPTrainerMixin:
         self.use_sp          = False
         self.train_dit       = True
         self._tp_save_restore = None
+        self._tp_requires_grad: dict | None = None
 
     # --- Hook: QKV fusion + TP sharding (after DiT load, before optimizer) ---
 
@@ -760,8 +775,15 @@ class TPSPTrainerMixin:
         # 4. Fix n_heads on each Attention to match local shard width
         n_attn_fixed = _fixup_attention_heads_for_tp(dit)
 
-        # 5. Mark replicated cross-attn KV layers to skip input grad (text encoder is frozen)
-        n_no_input_grad = _mark_replicated_context_layers_no_input_grad(dit, text_encoder_frozen=True)
+        # 5. Mark replicated cross-attn KV layers to skip input grad. Their input is the
+        #    LLM adapter output, so this is only safe when the adapter does not train.
+        adapter = getattr(dit, "llm_adapter", None) if use_llm_adapter else None
+        adapter_trains = (
+            adapter is not None
+            and getattr(args, "llm_adapter_lr", None) != 0
+            and any(p.requires_grad for p in adapter.parameters())
+        )
+        n_no_input_grad = _mark_replicated_context_layers_no_input_grad(dit, text_encoder_frozen=not adapter_trains)
 
         # 6. SP group: set on model so forward scatter/gather uses the right process group
         if self.use_sp:
@@ -849,6 +871,7 @@ class TPSPTrainerMixin:
 
         tp_group = self.tp_groups.tp
         dev      = accelerator.device
+        _sync_python_random(tp_group, dev)
 
         # Latents (shape differs across resolution buckets)
         if "latents" in batch and batch["latents"] is not None:
@@ -891,6 +914,8 @@ class TPSPTrainerMixin:
             # Gather all sharded weights to full tensors so the checkpoint has
             # correct shapes. Must be a collective (all ranks participate in
             # all_gather), so call on every rank before the rank-0-only write.
+            # Remember which params train (frozen LLM adapter / Anima 3.8B connector)
+            self._tp_requires_grad = {name: p.requires_grad for name, p in dit.named_parameters()}
             self._tp_save_restore = _gather_tp_weights_for_save(dit, self.tp_groups)
             unfuse_qkv_from_tp(dit)
 
@@ -907,8 +932,12 @@ class TPSPTrainerMixin:
                 _restore_tp_weight_shards(self._tp_save_restore)
                 self._tp_save_restore = None
             dit.requires_grad_(train_dit)
-            if getattr(dit, "anima_v2_connector", None) is not None:
-                dit.anima_v2_connector.requires_grad_(False)  # Anima 3.8B: the connector stays frozen
+            # Re-fusing creates new params: restore the pre-save flags so frozen parts stay frozen.
+            saved_flags = getattr(self, "_tp_requires_grad", None) or {}
+            for name, p in dit.named_parameters():
+                if name in saved_flags:
+                    p.requires_grad_(saved_flags[name])
+            self._tp_requires_grad = None
 
     # --- Hook: gather + final unfuse before end-of-training saves ---
 

@@ -149,8 +149,8 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         "--freeze_inserted_only_training",
         action="store_true",
         help=(
-            "For the 40-layer expanded Anima checkpoint, freeze inherited weights and train only the "
-            "12 inserted interleaved blocks. Requires the 40-layer checkpoint."
+            "For an expanded Anima checkpoint (40 blocks, or 52 for Anima 3.8B), freeze inherited "
+            "weights and train only the 12 inserted interleaved blocks."
         ),
     )
 
