@@ -304,3 +304,31 @@ def test_inserted_only_freeze_supports_52_blocks():
     trainable = [i for i, b in enumerate(dit.blocks) if b.weight.requires_grad]
     assert trainable == list(anima_block_freeze.INSERTED_52_BLOCK_INDICES) == summary["inserted_block_indices"]
     assert not dit.llm_adapter.weight.requires_grad  # the trainer re-enables it unless --llm_adapter_lr 0
+
+
+@pytest.mark.parametrize("base_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_tp_column_lora_backward_keeps_fp32_lora_weights(base_dtype):
+    """The TP column LoRA kernel must accept fp32 LoRA weights with a bf16/fp8 base (mixed precision)."""
+    from networks.lora_anima import _ColumnLoRAFwdBwd
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 7, 16, requires_grad=True)
+    weight = (torch.randn(24, 16) * 0.1).to(base_dtype)
+    bias = torch.randn(24).to(torch.bfloat16)
+    down = torch.randn(4, 16, requires_grad=True)
+    up = torch.randn(24, 4, requires_grad=True)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = _ColumnLoRAFwdBwd.apply(x, weight, bias, down, up, 0.5, None, 1)
+    assert isinstance(out, torch.Tensor)
+    out.float().pow(2).sum().backward()
+    grads = [t.grad.clone() for t in (x, down, up) if t.grad is not None]
+    assert len(grads) == 3
+    for t in (x, down, up):
+        t.grad = None
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        linear = torch.nn.functional.linear
+        ref = linear(x, weight.to(torch.bfloat16), bias) + linear(linear(x, down), up) * 0.5
+    ref.float().pow(2).sum().backward()
+    for got, t in zip(grads, (x, down, up), strict=True):
+        assert got.dtype == torch.float32
+        torch.testing.assert_close(got, t.grad)

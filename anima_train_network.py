@@ -11,7 +11,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
 
-from library import anima_38b_connector, anima_models, anima_train_utils, anima_utils, strategy_anima, strategy_base, train_util
+from library import anima_models, anima_train_utils, anima_utils, strategy_anima, strategy_base, train_util
 import train_network
 from library.utils import setup_logging
 
@@ -52,6 +52,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
         val_dataset_group: Optional[train_util.DatasetGroup],
     ):
+        from library import anima_38b_connector
+
         if not self.get_dit_load_kwargs(args).get("load_semantic_connector") and (
             anima_38b_connector.is_anima_38b_checkpoint(args.dit_path)
         ):
@@ -188,7 +190,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             return
         count = 0
         for module in unet.blocks.modules():
-            if isinstance(module, torch.nn.Linear):
+            # wd_parallel's TP layers are not nn.Linear subclasses
+            if isinstance(module, torch.nn.Linear) or type(module).__name__ in ("ColumnParallelLinear", "RowParallelLinear"):
                 module.weight.data = module.weight.data.to(dtype)
                 count += module.weight.numel()
         total = sum(p.numel() for p in unet.parameters())

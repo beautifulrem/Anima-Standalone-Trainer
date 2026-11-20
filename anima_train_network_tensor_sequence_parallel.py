@@ -599,6 +599,24 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
 
     # ----- override: skip DDP wrapping for TP models -----
 
+    def cast_unet_weights(self, args, unet, dtype):
+        """Cast the DiT without touching the TP LoRA modules registered inside it.
+
+        TP LoRA registers itself on its TP layer (``_tp_lora_adapter``), so a plain
+        ``unet.to(dtype)`` would also cast the trainable LoRA weights (bf16 instead
+        of fp32 master weights, or fp8 with --fp8_base).
+        """
+        detached = []
+        for module in list(unet.modules()):
+            adapter = module._modules.pop("_tp_lora_adapter", None)
+            if adapter is not None:
+                detached.append((module, adapter))
+        try:
+            super().cast_unet_weights(args, unet, dtype)
+        finally:
+            for module, adapter in detached:
+                module._modules["_tp_lora_adapter"] = adapter
+
     def prepare_unet_with_accelerator(self, args, accelerator, unet):
         """For TP: skip Accelerator's DDP wrap and install a TP-aware grad-norm.
 
