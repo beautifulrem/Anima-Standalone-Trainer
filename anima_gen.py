@@ -109,6 +109,7 @@ def load_models(args, accelerator):
         transformer_dtype=transformer_dtype,
         load_semantic_connector=use_38b,
         semantic_connector_path=args.semantic_connector or None,
+        ignore_semantic_connector=not use_38b,
     )
     dit.eval()
 
@@ -254,9 +255,8 @@ def load_models(args, accelerator):
             qwen35_tokenizer_path=args.qwen35_tokenizer_path,
             qwen35_max_length=args.qwen35_max_token_length,
         )
-        text_encoding_strategy = strategy_anima_38b.Anima38BTextEncodingStrategy(
-            dit.anima_v2_connector.layer_indices
-        )
+        connector = dit.anima_v2_connector  # attached by load_anima_dit(load_semantic_connector=True)
+        text_encoding_strategy = strategy_anima_38b.Anima38BTextEncodingStrategy(tuple(connector.layer_indices))
         text_encoders = [qwen3_text_encoder, qwen35_text_encoder]
     else:
         tokenize_strategy = strategy_anima.AnimaTokenizeStrategy(

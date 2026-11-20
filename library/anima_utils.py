@@ -37,7 +37,8 @@ def load_anima_dit(
     llm_adapter_path: Optional[str] = None,
     disable_mmap: bool = False,
     load_semantic_connector: bool = False,
-    semantic_connector_path: Optional[str] = None,
+    semantic_connector_path: "str | None" = None,
+    ignore_semantic_connector: bool = False,
 ) -> anima_models.MiniTrainDIT:
     """Load the MiniTrainDIT model from safetensors.
 
@@ -51,6 +52,7 @@ def load_anima_dit(
         load_semantic_connector: Attach the Anima 3.8B Qwen3.5 semantic connector as
             ``dit.anima_v2_connector`` (from the bundled checkpoint or ``semantic_connector_path``)
         semantic_connector_path: Optional standalone v1/v2 semantic connector file
+        ignore_semantic_connector: Drop a bundled connector instead of raising (inference without Qwen3.5)
     """
     if transformer_dtype is None:
         transformer_dtype = dtype
@@ -87,12 +89,17 @@ def load_anima_dit(
         if k.startswith(anima_38b_connector.CONNECTOR_PREFIX)
     }
     if connector_state and not load_semantic_connector:
-        logger.warning(
-            f"{os.path.basename(dit_path)} bundles an Anima 3.8B Qwen3.5 semantic connector "
-            f"({len(connector_state)} tensors). This script ignores it and trains against the native "
-            "Qwen3 adapter only, which does not match how the model is used at inference. "
-            "Use anima_38b_train_network.py for Anima 3.8B."
+        message = (
+            f"{os.path.basename(dit_path)} is an Anima 3.8B checkpoint with a bundled Qwen3.5 semantic connector "
+            f"({len(connector_state)} tensors)."
         )
+        if not ignore_semantic_connector:
+            # Training without the connector would condition the DiT differently from inference,
+            # and a full fine-tune would save a checkpoint with the connector silently removed.
+            raise RuntimeError(
+                message + " This script does not support it; use anima_38b_train_network.py (LoRA) for Anima 3.8B."
+            )
+        logger.warning(message + " Ignoring it: only the native Qwen3 adapter is used.")
         connector_state = {}
 
     # Derive config from state_dict
@@ -152,9 +159,9 @@ def load_anima_dit(
 def _attach_semantic_connector(
     dit: anima_models.MiniTrainDIT,
     dit_path: str,
-    dit_state_dict: Dict[str, torch.Tensor],
-    bundled_state: Dict[str, torch.Tensor],
-    semantic_connector_path: Optional[str],
+    dit_state_dict: "dict[str, torch.Tensor]",
+    bundled_state: "dict[str, torch.Tensor]",
+    semantic_connector_path: "str | None",
 ) -> None:
     """Build the Anima 3.8B semantic connector and attach it as ``dit.anima_v2_connector``."""
     from library import anima_38b_connector as connector_lib

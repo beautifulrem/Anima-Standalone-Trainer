@@ -1439,12 +1439,12 @@ class MiniTrainDIT(nn.Module):
     def compute_crossattn_emb(
         self,
         crossattn_emb: torch.Tensor,
-        timesteps: Optional[torch.Tensor] = None,
-        source_attention_mask: Optional[torch.Tensor] = None,
-        t5_input_ids: Optional[torch.Tensor] = None,
-        t5_attn_mask: Optional[torch.Tensor] = None,
-        semantic_hidden_states: Optional[List[torch.Tensor]] = None,
-        semantic_attention_mask: Optional[torch.Tensor] = None,
+        timesteps: "torch.Tensor | None" = None,
+        source_attention_mask: "torch.Tensor | None" = None,
+        t5_input_ids: "torch.Tensor | None" = None,
+        t5_attn_mask: "torch.Tensor | None" = None,
+        semantic_hidden_states: "list[torch.Tensor] | None" = None,
+        semantic_attention_mask: "torch.Tensor | None" = None,
     ) -> torch.Tensor:
         """Map text-encoder outputs to DiT cross-attention context.
 
@@ -1463,11 +1463,15 @@ class MiniTrainDIT(nn.Module):
             # The frozen connector only needs autograd when LoRA patches the
             # native adapter it reuses (train_llm_adapter) or it is trained itself.
             grad_enabled = torch.is_grad_enabled() and getattr(self, 'semantic_connector_grad', True)
+            # Like ComfyUI: feed both streams in the native adapter's dtype.
+            adapter_dtype = self.llm_adapter.embed.weight.dtype
+            if not adapter_dtype.is_floating_point or adapter_dtype.itemsize == 1:
+                adapter_dtype = crossattn_emb.dtype
             with torch.set_grad_enabled(grad_enabled):
                 crossattn_emb = connector(
-                    native_source=crossattn_emb,
+                    native_source=crossattn_emb.to(adapter_dtype),
                     target_input_ids=t5_input_ids,
-                    semantic_hidden_states=semantic_hidden_states,
+                    semantic_hidden_states=[s.to(adapter_dtype) for s in semantic_hidden_states],
                     target_attention_mask=t5_attn_mask,
                     native_source_mask=source_attention_mask,
                     semantic_source_mask=semantic_attention_mask,
@@ -1500,8 +1504,8 @@ class MiniTrainDIT(nn.Module):
         source_attention_mask: Optional[torch.Tensor] = None,
         t5_input_ids: Optional[torch.Tensor] = None,
         t5_attn_mask: Optional[torch.Tensor] = None,
-        semantic_hidden_states: Optional[List[torch.Tensor]] = None,
-        semantic_attention_mask: Optional[torch.Tensor] = None,
+        semantic_hidden_states: "list[torch.Tensor] | None" = None,
+        semantic_attention_mask: "torch.Tensor | None" = None,
     ) -> torch.Tensor:
         """
         Args:

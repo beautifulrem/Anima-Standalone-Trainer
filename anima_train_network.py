@@ -166,6 +166,25 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Return format: (model_type, text_encoders, vae, unet)
         return "anima", [self.qwen3_text_encoder], self.vae, dit
 
+    def cast_unet_weights(self, args, unet, dtype):
+        """For --fp8_base only the DiT blocks' Linear weights become fp8.
+
+        Casting the whole DiT breaks the LLM adapter (embedding, RMSNorm) and the
+        Anima 3.8B connector, whose element-wise ops cannot mix fp8 and float
+        ("Promotion for Float8 Types is not supported"). Block Linear weights hold
+        nearly all parameters and are upcast by autocast inside F.linear.
+        """
+        if dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            unet.to(dtype=dtype)
+            return
+        count = 0
+        for module in unet.blocks.modules():
+            if isinstance(module, torch.nn.Linear):
+                module.weight.data = module.weight.data.to(dtype)
+                count += module.weight.numel()
+        total = sum(p.numel() for p in unet.parameters())
+        logger.info(f"fp8_base: {count / 1e6:.0f}M of {total / 1e6:.0f}M DiT parameters (block Linear weights) cast to {dtype}")
+
     def get_dit_load_kwargs(self, args) -> dict:
         """Extra keyword arguments for anima_utils.load_anima_dit (overridden for Anima 3.8B)."""
         return {}

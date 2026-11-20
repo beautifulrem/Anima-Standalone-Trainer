@@ -84,10 +84,18 @@ launches `anima_38b_train_network.py` automatically.
   the Qwen3.5 conditioning with the empty-prompt conditioning.
 - **Sample images during training** recompute the connector at every step.
   Parallel CFG is disabled for these samples.
-- **Not supported:**
-  - full fine-tuning;
+- **`--fp8_base`**: only the DiT blocks' Linear weights become fp8 (most of the
+  parameters). The LLM adapter, the connector, embedders and norms stay in the
+  training dtype, because element-wise ops cannot mix fp8 and float. This also
+  fixes `--fp8_base` for regular Anima LoRA training, where casting the whole
+  DiT used to fail in the LLM adapter.
+- **Not supported** (rejected with a clear error):
+  - full fine-tuning (`anima_train.py`, `anima_train_muon.py`);
   - TP/SP;
   - training the text encoders;
   - `--weighted_captions`.
+- Every non-3.8B training script refuses an Anima 3.8B bundle. Otherwise it would
+  train without the connector, and a full fine-tune would save the model with
+  the connector removed.
 - **Saved LoRAs** use the usual `lora_unet_blocks_N_*` names for blocks 0–51,
   and load in ComfyUI like any Anima LoRA.

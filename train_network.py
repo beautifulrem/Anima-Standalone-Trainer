@@ -615,6 +615,10 @@ class NetworkTrainer:
 
         return loss.mean()
 
+    def cast_unet_weights(self, args, unet, dtype):
+        """Cast the U-Net/DiT weights to ``dtype`` (fp8 for --fp8_base). Architectures may keep parts in high precision."""
+        unet.to(dtype=dtype)
+
     def cast_text_encoder(self, args):
         return True  # default for other than HunyuanImage
 
@@ -1026,11 +1030,11 @@ class NetworkTrainer:
             # logger.info(f"set U-Net weight dtype to {unet_weight_dtype}, device to {accelerator.device}")
             # unet.to(accelerator.device, dtype=unet_weight_dtype)  # this seems to be safer than above
             logger.info(f"set U-Net weight dtype to {unet_weight_dtype}")
-            unet.to(dtype=unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
+            self.cast_unet_weights(args, unet, unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
 
         unet.requires_grad_(False)
         if self.cast_unet(args):
-            unet.to(dtype=unet_weight_dtype)
+            self.cast_unet_weights(args, unet, unet_weight_dtype)
         for i, t_enc in enumerate(text_encoders):
             t_enc.requires_grad_(False)
 
@@ -1063,7 +1067,7 @@ class NetworkTrainer:
 
             if is_fsdp2:
                 if self.cast_unet(args):
-                    unet.to(dtype=unet_weight_dtype)
+                    self.cast_unet_weights(args, unet, unet_weight_dtype)
                 network.to(accelerator.device)
 
                 # Collect models to shard: unet + text encoders that are on GPU.
@@ -1109,11 +1113,13 @@ class NetworkTrainer:
                     # FSDP1: wrap the frozen UNet so its parameters are SHARDED across GPUs.
                     # Without this, each GPU holds a full copy (same as DDP) and FSDP saves no VRAM.
                     if self.cast_unet(args):
-                        unet.to(dtype=unet_weight_dtype)
+                        self.cast_unet_weights(args, unet, unet_weight_dtype)
                     unet = self.prepare_unet_with_accelerator(args, accelerator, unet)
                 else:
                     # Standard DDP: move to device because unet is not prepared by accelerator
-                    unet.to(accelerator.device, dtype=unet_weight_dtype if self.cast_unet(args) else None)
+                    unet.to(accelerator.device)
+                    if self.cast_unet(args):
+                        self.cast_unet_weights(args, unet, unet_weight_dtype)
 
                 if train_text_encoder:
                     text_encoders = [
