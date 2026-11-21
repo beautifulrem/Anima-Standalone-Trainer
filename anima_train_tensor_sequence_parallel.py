@@ -535,6 +535,20 @@ def _gather_tp_weights_for_save(dit: torch.nn.Module, tp_groups) -> list:
     return restore_info
 
 
+def _sync_seed_arg(args) -> None:
+    """Without --seed every process draws its own random seed, so TP ranks would
+    sample different noise and timesteps for the same (sharded) forward pass.
+    Use rank 0's seed everywhere."""
+    import random
+
+    if args.seed is not None:
+        return
+    seed = [random.randint(0, 2**32 - 1) if dist.get_rank() == 0 else None]
+    dist.broadcast_object_list(seed, src=0)
+    args.seed = seed[0]
+    logger.info(f"TP: no --seed given; every rank uses rank 0's random seed {args.seed}")
+
+
 def _sync_python_random(tp_group, device) -> None:
     """Give every TP rank rank 0's Python RNG stream for this step.
 
@@ -1072,6 +1086,7 @@ if __name__ == "__main__":
     use_sp     = getattr(args, 'sequence_parallel', False)
     tp_config  = wdp.ParallelConfig(tp=True, sp=use_sp, tp_degree=tp_degree)
     tp_groups  = wdp.init_dist(tp_config)
+    _sync_seed_arg(args)
     logger.info(
         f"TP+SP initialized: rank={tp_groups.tp_rank}/{tp_groups.tp_size}, "
         f"backend={tp_backend}, sp={use_sp}"

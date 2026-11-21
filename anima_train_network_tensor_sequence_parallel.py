@@ -53,6 +53,20 @@ from anima_train_network import AnimaNetworkTrainer
 from library import anima_38b_train_utils  # noqa: E402
 
 
+def _sync_seed_arg(args) -> None:
+    """Without --seed every process draws its own random seed, so TP ranks would
+    sample different noise and timesteps for the same (sharded) forward pass.
+    Use rank 0's seed everywhere."""
+    import random
+
+    if args.seed is not None:
+        return
+    seed = [random.randint(0, 2**32 - 1) if dist.get_rank() == 0 else None]
+    dist.broadcast_object_list(seed, src=0)
+    args.seed = seed[0]
+    logger.info(f"TP: no --seed given; every rank uses rank 0's random seed {args.seed}")
+
+
 def _sync_python_random(tp_group, device) -> None:
     """Give every TP rank rank 0's Python RNG stream for this step.
 
@@ -1281,6 +1295,7 @@ if __name__ == "__main__":
 
     tp_config = wdp.ParallelConfig(tp=True, sp=True, tp_degree=tp_degree)
     tp_groups = wdp.init_dist(tp_config)
+    _sync_seed_arg(args)
     logger.info(f"TP+SP initialized: rank={tp_groups.tp_rank}/{tp_groups.tp_size}, backend={tp_backend}")
     logger.info(f"Using model paths: dit={args.dit_path}, qwen3={args.qwen3_path}, vae={args.vae_path}")
     save_utils.install_parallel_state_wrappers(
