@@ -53,34 +53,6 @@ from anima_train_network import AnimaNetworkTrainer
 from library import anima_38b_train_utils  # noqa: E402
 
 
-def _sync_seed_arg(args) -> None:
-    """Without --seed every process draws its own random seed, so TP ranks would
-    sample different noise and timesteps for the same (sharded) forward pass.
-    Use rank 0's seed everywhere."""
-    import random
-
-    if args.seed is not None:
-        return
-    seed = [random.randint(0, 2**32 - 1) if dist.get_rank() == 0 else None]
-    dist.broadcast_object_list(seed, src=0)
-    args.seed = seed[0]
-    logger.info(f"TP: no --seed given; every rank uses rank 0's random seed {args.seed}")
-
-
-def _sync_python_random(tp_group, device) -> None:
-    """Give every TP rank rank 0's Python RNG stream for this step.
-
-    Caption dropout (strategy_anima*.drop_cached_text_encoder_outputs) draws from
-    Python's ``random``. TP ranks must drop the same captions, otherwise they
-    compute one forward pass from different cross-attention contexts.
-    """
-    import random
-
-    seed = torch.tensor([random.getrandbits(62)], dtype=torch.int64, device=device)
-    dist.broadcast(seed, src=0, group=tp_group)
-    random.seed(int(seed.item()))
-
-
 def _ceil_to_multiple(size: int, multiple: int) -> int:
     return ((size + multiple - 1) // multiple) * multiple
 
@@ -414,24 +386,6 @@ def _mark_replicated_context_layers_no_input_grad(
     return marked
 
 
-def _restore_replicated_context_input_grad(model: torch.nn.Module, network: torch.nn.Module) -> int:
-    """Undo _mark_replicated_context_layers_no_input_grad when LoRA trains the LLM adapter.
-
-    The cross-attn context is the adapter output, so its LoRA needs the input grad.
-    Networks without the flag (e.g. LyCORIS) may patch the adapter too.
-    """
-    if not getattr(model, "use_llm_adapter", False) or not getattr(network, "train_llm_adapter", True):
-        return 0
-    restored = 0
-    for module in model.modules():
-        if getattr(module, "skip_input_grad", False):
-            module.skip_input_grad = False  # pyright: ignore[reportArgumentType]
-            restored += 1
-    if restored:
-        logger.info(f"LLM adapter LoRA: re-enabled input grad on {restored} replicated cross-attn context layers")
-    return restored
-
-
 def _tag_tp_lora_params(network: torch.nn.Module) -> tuple[int, int]:
     """Tag TP-sharded and SP-partial LoRA params for wd_parallel grad sync.
 
@@ -613,24 +567,6 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
 
     # ----- override: skip DDP wrapping for TP models -----
 
-    def cast_unet_weights(self, args, unet, dtype):
-        """Cast the DiT without touching the TP LoRA modules registered inside it.
-
-        TP LoRA registers itself on its TP layer (``_tp_lora_adapter``), so a plain
-        ``unet.to(dtype)`` would also cast the trainable LoRA weights (bf16 instead
-        of fp32 master weights, or fp8 with --fp8_base).
-        """
-        detached = []
-        for module in list(unet.modules()):
-            adapter = module._modules.pop("_tp_lora_adapter", None)
-            if adapter is not None:
-                detached.append((module, adapter))
-        try:
-            super().cast_unet_weights(args, unet, dtype)
-        finally:
-            for module, adapter in detached:
-                module._modules["_tp_lora_adapter"] = adapter
-
     def prepare_unet_with_accelerator(self, args, accelerator, unet):
         """For TP: skip Accelerator's DDP wrap and install a TP-aware grad-norm.
 
@@ -780,7 +716,6 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             self._tp_last_args = args
             tp_group = self.tp_groups.tp
             dev = accelerator.device
-            _sync_python_random(tp_group, dev)
 
             # Latents (main tensor - shape differs across resolution buckets)
             if "latents" in batch and batch["latents"] is not None:
@@ -955,8 +890,6 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
         if not self.tp_active:
             return
 
-        _restore_replicated_context_input_grad(unet, network)
-
         sharded, partial = _tag_tp_lora_params(network)
         logger.info(f"Tagged {sharded} TP-sharded LoRA parameters and {partial} SP-partial replicated LoRA parameters")
         self._tp_diag(args, f"lora_params sharded={sharded} sp_partial_replicated={partial}", all_ranks=True, to_logger=True, force=True)
@@ -1119,13 +1052,11 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
         from library.anima_train_utils import _sample_image_inference
 
         lora_network = getattr(self, "_tp_lora_network", None)
-        # Keep the original tensors: casting back after sampling (fp32 -> bf16 -> fp32)
-        # would round the trained fp32 LoRA weights every time samples are generated.
-        original_lora_data = []
+        original_lora_dtypes = []
         if lora_network is not None:
             for param in lora_network.parameters():
-                if param.is_floating_point() and param.dtype != sample_dtype:
-                    original_lora_data.append((param, param.data))
+                if param.is_floating_point():
+                    original_lora_dtypes.append((param, param.dtype))
                     param.data = param.data.to(dtype=sample_dtype)
 
         try:
@@ -1141,8 +1072,8 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
                         save_image=(tp_rank == 0),
                     )
         finally:
-            for param, data in original_lora_data:
-                param.data = data
+            for param, dtype in original_lora_dtypes:
+                param.data = param.data.to(dtype=dtype)
 
             vae.to(org_vae_device)
             clean_memory_on_device(accelerator.device)
@@ -1295,7 +1226,6 @@ if __name__ == "__main__":
 
     tp_config = wdp.ParallelConfig(tp=True, sp=True, tp_degree=tp_degree)
     tp_groups = wdp.init_dist(tp_config)
-    _sync_seed_arg(args)
     logger.info(f"TP+SP initialized: rank={tp_groups.tp_rank}/{tp_groups.tp_size}, backend={tp_backend}")
     logger.info(f"Using model paths: dit={args.dit_path}, qwen3={args.qwen3_path}, vae={args.vae_path}")
     save_utils.install_parallel_state_wrappers(

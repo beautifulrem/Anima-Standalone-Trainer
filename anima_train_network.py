@@ -190,8 +190,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             return
         count = 0
         for module in unet.blocks.modules():
-            # wd_parallel's TP layers are not nn.Linear subclasses
-            if isinstance(module, torch.nn.Linear) or type(module).__name__ in ("ColumnParallelLinear", "RowParallelLinear"):
+            if isinstance(module, torch.nn.Linear):
                 module.weight.data = module.weight.data.to(dtype)
                 count += module.weight.numel()
         total = sum(p.numel() for p in unet.parameters())
@@ -511,11 +510,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                     input_ids,
                 )
                 if args.full_fp16:
-                    # only float outputs: token ids / masks must stay exact
-                    encoded_text_encoder_conds = [
-                        c.to(weight_dtype) if c is not None and c.is_floating_point() else c
-                        for c in encoded_text_encoder_conds
-                    ]
+                    encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
 
             if len(text_encoder_conds) == 0:
                 text_encoder_conds = encoded_text_encoder_conds

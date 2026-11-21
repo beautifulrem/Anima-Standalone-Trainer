@@ -477,23 +477,12 @@ def unfuse_qkv_from_tp(model: torch.nn.Module) -> None:
 def _gather_tp_weights_for_save(dit: torch.nn.Module, tp_groups) -> list:
     """All-gather TP-sharded weights to full tensors so checkpoints are valid.
 
-    Packed (fused QKV/KV) layers are reassembled per part, so Q/K/V stay in
-    order, and column-parallel biases are gathered too.
-
-    Returns restore_info: list of (parent_module, attr_name, module, weight_shard, bias_shard)
+    Returns restore_info: list of (parent_module, attr_name, module, shard_data)
     so callers can restore the original sharded ColumnParallel/RowParallel modules
     after saving (the modules are kept alive via these references).
     """
     import torch.distributed as dist
-    from wd_parallel.layers import ColumnParallelLinear, RowParallelLinear, merge_column_shards, merge_row_shards
-
-    def _all_gather(value) -> list:
-        if not isinstance(value, torch.Tensor):
-            raise TypeError(f"expected a tensor, got {type(value).__name__}")
-        t = value.detach().contiguous()
-        gathered = [torch.zeros_like(t) for _ in range(tp_groups.tp_size)]
-        dist.all_gather(gathered, t, group=tp_groups.tp)
-        return gathered
+    from wd_parallel.layers import ColumnParallelLinear, RowParallelLinear
 
     restore_info = []
     for name, module in dit.named_modules():
@@ -502,73 +491,38 @@ def _gather_tp_weights_for_save(dit: torch.nn.Module, tp_groups) -> list:
         if not (is_col or is_row):
             continue
 
-        weight = module.weight
-        bias = module.bias
-        if not isinstance(weight, torch.Tensor):
-            continue
-        shard = weight.data.clone()
-        bias_shard = None
+        shard = module.weight.data.clone()
+        w = module.weight.data.contiguous()
+        tp_size = tp_groups.tp_size
+        gathered = [torch.zeros_like(w) for _ in range(tp_size)]
+        dist.all_gather(gathered, w, group=tp_groups.tp)
+
+        gather_dim = 0 if is_col else 1
+        full = torch.cat(gathered, dim=gather_dim)
+
+        # Trim padding back to original unpadded size
         if is_col:
-            packed = {
-                "packed_parts": getattr(module, "packed_parts", None),
-                "original_part_size": getattr(module, "original_part_size", None),
-                "padded_part_size": getattr(module, "padded_part_size", None),
-            }
-            original_out = int(getattr(module, "original_out_features", module.out_features * tp_groups.tp_size))
-            module.weight.data = merge_column_shards(
-                _all_gather(weight), original_out_features=original_out, dim=0, **packed
-            )
-            if isinstance(bias, torch.Tensor):
-                bias_shard = bias.data.clone()
-                bias.data = merge_column_shards(
-                    _all_gather(bias), original_out_features=original_out, dim=0, **packed
-                )
+            orig = getattr(module, 'original_out_features', None)
+            if orig is not None:
+                full = full[:int(orig)]
         else:
-            original_in = int(getattr(module, "original_in_features", module.in_features * tp_groups.tp_size))
-            module.weight.data = merge_row_shards(_all_gather(weight), original_in_features=original_in, dim=1)
-            # row-parallel biases are replicated, not sharded
+            orig = getattr(module, 'original_in_features', None)
+            if orig is not None:
+                full = full[:, :int(orig)]
+
+        module.weight.data = full
 
         parent_path, attr = name.rsplit('.', 1) if '.' in name else ('', name)
         parent = dit.get_submodule(parent_path) if parent_path else dit
-        restore_info.append((parent, attr, module, shard, bias_shard))
+        restore_info.append((parent, attr, module, shard))
 
     return restore_info
 
 
-def _sync_seed_arg(args) -> None:
-    """Without --seed every process draws its own random seed, so TP ranks would
-    sample different noise and timesteps for the same (sharded) forward pass.
-    Use rank 0's seed everywhere."""
-    import random
-
-    if args.seed is not None:
-        return
-    seed = [random.randint(0, 2**32 - 1) if dist.get_rank() == 0 else None]
-    dist.broadcast_object_list(seed, src=0)
-    args.seed = seed[0]
-    logger.info(f"TP: no --seed given; every rank uses rank 0's random seed {args.seed}")
-
-
-def _sync_python_random(tp_group, device) -> None:
-    """Give every TP rank rank 0's Python RNG stream for this step.
-
-    Caption dropout (strategy_anima*.drop_cached_text_encoder_outputs) draws from
-    Python's ``random``. TP ranks must drop the same captions, otherwise they
-    compute one forward pass from different cross-attention contexts.
-    """
-    import random
-
-    seed = torch.tensor([random.getrandbits(62)], dtype=torch.int64, device=device)
-    dist.broadcast(seed, src=0, group=tp_group)
-    random.seed(int(seed.item()))
-
-
 def _restore_tp_weight_shards(restore_info: list) -> None:
     """Restore ColumnParallel/RowParallel modules with their original shard weights."""
-    for parent, attr, module, shard, bias_shard in restore_info:
+    for parent, attr, module, shard in restore_info:
         module.weight.data = shard
-        if bias_shard is not None:
-            module.bias.data = bias_shard
         setattr(parent, attr, module)
 
 
@@ -755,7 +709,6 @@ class TPSPTrainerMixin:
         self.use_sp          = False
         self.train_dit       = True
         self._tp_save_restore = None
-        self._tp_requires_grad: dict | None = None
 
     # --- Hook: QKV fusion + TP sharding (after DiT load, before optimizer) ---
 
@@ -789,15 +742,8 @@ class TPSPTrainerMixin:
         # 4. Fix n_heads on each Attention to match local shard width
         n_attn_fixed = _fixup_attention_heads_for_tp(dit)
 
-        # 5. Mark replicated cross-attn KV layers to skip input grad. Their input is the
-        #    LLM adapter output, so this is only safe when the adapter does not train.
-        adapter = getattr(dit, "llm_adapter", None) if use_llm_adapter else None
-        adapter_trains = (
-            adapter is not None
-            and getattr(args, "llm_adapter_lr", None) != 0
-            and any(p.requires_grad for p in adapter.parameters())
-        )
-        n_no_input_grad = _mark_replicated_context_layers_no_input_grad(dit, text_encoder_frozen=not adapter_trains)
+        # 5. Mark replicated cross-attn KV layers to skip input grad (text encoder is frozen)
+        n_no_input_grad = _mark_replicated_context_layers_no_input_grad(dit, text_encoder_frozen=True)
 
         # 6. SP group: set on model so forward scatter/gather uses the right process group
         if self.use_sp:
@@ -885,7 +831,6 @@ class TPSPTrainerMixin:
 
         tp_group = self.tp_groups.tp
         dev      = accelerator.device
-        _sync_python_random(tp_group, dev)
 
         # Latents (shape differs across resolution buckets)
         if "latents" in batch and batch["latents"] is not None:
@@ -928,8 +873,6 @@ class TPSPTrainerMixin:
             # Gather all sharded weights to full tensors so the checkpoint has
             # correct shapes. Must be a collective (all ranks participate in
             # all_gather), so call on every rank before the rank-0-only write.
-            # Remember which params train (frozen LLM adapter / Anima 3.8B connector)
-            self._tp_requires_grad = {name: p.requires_grad for name, p in dit.named_parameters()}
             self._tp_save_restore = _gather_tp_weights_for_save(dit, self.tp_groups)
             unfuse_qkv_from_tp(dit)
 
@@ -946,12 +889,8 @@ class TPSPTrainerMixin:
                 _restore_tp_weight_shards(self._tp_save_restore)
                 self._tp_save_restore = None
             dit.requires_grad_(train_dit)
-            # Re-fusing creates new params: restore the pre-save flags so frozen parts stay frozen.
-            saved_flags = getattr(self, "_tp_requires_grad", None) or {}
-            for name, p in dit.named_parameters():
-                if name in saved_flags:
-                    p.requires_grad_(saved_flags[name])
-            self._tp_requires_grad = None
+            if getattr(dit, "anima_v2_connector", None) is not None:
+                dit.anima_v2_connector.requires_grad_(False)  # Anima 3.8B: the connector stays frozen
 
     # --- Hook: gather + final unfuse before end-of-training saves ---
 
@@ -1086,7 +1025,6 @@ if __name__ == "__main__":
     use_sp     = getattr(args, 'sequence_parallel', False)
     tp_config  = wdp.ParallelConfig(tp=True, sp=use_sp, tp_degree=tp_degree)
     tp_groups  = wdp.init_dist(tp_config)
-    _sync_seed_arg(args)
     logger.info(
         f"TP+SP initialized: rank={tp_groups.tp_rank}/{tp_groups.tp_size}, "
         f"backend={tp_backend}, sp={use_sp}"

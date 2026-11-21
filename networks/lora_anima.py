@@ -86,10 +86,6 @@ class _ColumnLoRAFwdBwd(torch.autograd.Function):
         lora_mid = torch.nn.functional.linear(gathered, lora_down_weight, None)
         output = torch.nn.functional.linear(gathered, base_weight, bias)
         output = output + torch.nn.functional.linear(lora_mid, lora_up_weight, None) * ctx.lora_scale
-        # Backward runs outside autocast: redo it in the forward compute dtype. Weights may
-        # differ from it (fp32 LoRA master weights, bf16 or fp8 base); autograd casts each
-        # returned gradient back to its parameter's dtype.
-        ctx.compute_dtype = output.dtype
 
         ctx.save_for_backward(input_, base_weight, lora_down_weight, lora_up_weight, lora_mid)
         return output
@@ -110,12 +106,8 @@ class _ColumnLoRAFwdBwd(torch.autograd.Function):
         need_grad_lora_up = ctx.needs_input_grad[4] and ctx.lora_up_requires_grad
         need_full_input = need_grad_base_weight or need_grad_lora_down
 
-        compute_dtype = ctx.compute_dtype
-        grad_output = grad_output.to(compute_dtype)
-        base_weight = base_weight.to(compute_dtype)
-        lora_down_weight = lora_down_weight.to(compute_dtype)
-        lora_up_weight = lora_up_weight.to(compute_dtype)
-        lora_mid = lora_mid.to(compute_dtype)
+        if grad_output.dtype != base_weight.dtype:
+            grad_output = grad_output.to(base_weight.dtype)
 
         if do_async and need_full_input:
             ag_buf, ag_handle, ag_transpose = _async_all_gather_seq_dim(input_, group, seq_dim)
@@ -151,8 +143,8 @@ class _ColumnLoRAFwdBwd(torch.autograd.Function):
         else:
             gathered = None
 
-        if gathered is not None and gathered.dtype != compute_dtype:
-            gathered = gathered.to(compute_dtype)
+        if gathered is not None and gathered.dtype != base_weight.dtype:
+            gathered = gathered.to(base_weight.dtype)
 
         if need_grad_base_weight:
             grad_weight_base = grad_output.reshape(-1, grad_output.shape[-1]).t().matmul(
@@ -953,8 +945,7 @@ class LoRANetwork(torch.nn.Module):
                     converted[f"{std_prefix}.lora_down.weight"] = converted[down_key]
                 if up_key in converted:
                     converted[f"{std_prefix}.lora_up.weight"] = converted[up_key]
-                # one tensor per key: safetensors refuses shared storage (e.g. saving without dtype casting)
-                converted[f"{std_prefix}.alpha"] = alpha.clone()
+                converted[f"{std_prefix}.alpha"] = alpha
             for key in list(converted.keys()):
                 if key == alpha_key or key.startswith(f"{prefix}.lora_down.") or key.startswith(f"{prefix}.lora_up."):
                     del converted[key]
