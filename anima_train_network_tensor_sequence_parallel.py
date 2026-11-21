@@ -1105,11 +1105,13 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
         from library.anima_train_utils import _sample_image_inference
 
         lora_network = getattr(self, "_tp_lora_network", None)
-        original_lora_dtypes = []
+        # Keep the original tensors: casting back after sampling (fp32 -> bf16 -> fp32)
+        # would round the trained fp32 LoRA weights every time samples are generated.
+        original_lora_data = []
         if lora_network is not None:
             for param in lora_network.parameters():
-                if param.is_floating_point():
-                    original_lora_dtypes.append((param, param.dtype))
+                if param.is_floating_point() and param.dtype != sample_dtype:
+                    original_lora_data.append((param, param.data))
                     param.data = param.data.to(dtype=sample_dtype)
 
         try:
@@ -1125,8 +1127,8 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
                         save_image=(tp_rank == 0),
                     )
         finally:
-            for param, dtype in original_lora_dtypes:
-                param.data = param.data.to(dtype=dtype)
+            for param, data in original_lora_data:
+                param.data = data
 
             vae.to(org_vae_device)
             clean_memory_on_device(accelerator.device)

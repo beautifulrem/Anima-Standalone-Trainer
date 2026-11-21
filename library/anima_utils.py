@@ -169,7 +169,7 @@ def _attach_semantic_connector(
     if not getattr(dit, "use_llm_adapter", False) or not hasattr(dit, "llm_adapter"):
         raise RuntimeError("The Anima 3.8B semantic connector needs a DiT with an LLM adapter.")
 
-    dit_metadata = connector_lib.read_safetensors_metadata(dit_path) if dit_path.endswith(".safetensors") else {}
+    dit_metadata = connector_lib.read_safetensors_metadata(dit_path) if dit_path.lower().endswith(".safetensors") else {}
     if semantic_connector_path:
         if bundled_state:
             logger.info(f"Using {semantic_connector_path} instead of the connector bundled in {os.path.basename(dit_path)}")
