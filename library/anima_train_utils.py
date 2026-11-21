@@ -533,8 +533,12 @@ def do_sample(
     x_doubled = torch.empty(2, *x.shape[1:], device=device, dtype=dtype)
     t_doubled = torch.empty(2, device=device, dtype=dtype)
 
+    # Sampling runs without autocast, except with --fp8_base: fp8 Linear weights need
+    # autocast to be upcast inside F.linear (as in training).
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    has_fp8_weights = any(p.dtype in fp8_dtypes for p in dit.parameters())
     try:
-        with torch.autocast(device_type=device.type, enabled=False):
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=has_fp8_weights):
             for i in tqdm(range(steps), desc="Sampling"):
                 sigma = sigmas[i]
 
